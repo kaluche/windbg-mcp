@@ -1,0 +1,404 @@
+using System.Diagnostics;
+using System.Text.RegularExpressions;
+using Microsoft.Extensions.Logging;
+using WinDbgMCP.Server.Configuration;
+using WinDbgMCP.Server.State;
+
+namespace WinDbgMCP.Server.Vmware;
+
+/// <summary>
+/// Wraps vmrun CLI. All operations are async with timeout.
+/// Every vmrun call:
+///   1. Has a timeout (kills process on timeout)
+///   2. Captures stdout and stderr
+///   3. Parses exit codes (0 = success, nonzero = error)
+/// </summary>
+public sealed class VmwareManager
+{
+    private readonly string _vmrunPath;
+    private readonly string _vmxPath;
+    private readonly string _guestUser;
+    private readonly string _guestPass;
+    private readonly TimeoutConfig _timeouts;
+    private readonly ILogger<VmwareManager> _logger;
+
+    public string VmxPath => _vmxPath;
+
+    public VmwareManager(ServerConfig config, ILogger<VmwareManager> logger)
+    {
+        _vmrunPath = config.Vm.VmrunPath;
+        _vmxPath = config.Vm.VmxPath;
+        _guestUser = config.Vm.GuestUsername;
+        _guestPass = config.Vm.GuestPassword;
+        _timeouts = config.Timeouts;
+        _logger = logger;
+
+        // Validate vmrun exists at startup
+        if (!File.Exists(_vmrunPath))
+        {
+            throw new FileNotFoundException(
+                $"vmrun not found at '{_vmrunPath}'. " +
+                "Install VMware Workstation Pro and verify the vmrunPath in appsettings.json.",
+                _vmrunPath);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  POWER OPERATIONS
+    // ═══════════════════════════════════════════════════════════════
+
+    public async Task<VmResult> StartAsync(bool headless = true, CancellationToken ct = default)
+    {
+        var guiArg = headless ? "nogui" : "gui";
+        var result = await RunVmrunAsync(
+            $"-T ws start \"{_vmxPath}\" {guiArg}",
+            TimeSpan.FromSeconds(_timeouts.VmStartSeconds), ct);
+
+        if (result.Success)
+            return VmResult.Ok("VM started successfully.");
+
+        return VmResult.Failed(
+            $"Failed to start VM: {result.Stderr.Trim()}",
+            $"Exit code: {result.ExitCode}");
+    }
+
+    public async Task<VmResult> StopAsync(bool hard = false, CancellationToken ct = default)
+    {
+        var mode = hard ? "hard" : "soft";
+        var result = await RunVmrunAsync(
+            $"-T ws stop \"{_vmxPath}\" {mode}",
+            TimeSpan.FromSeconds(_timeouts.VmStopSeconds), ct);
+
+        if (result.Success)
+            return VmResult.Ok($"VM stopped ({mode}).");
+
+        return VmResult.Failed(
+            $"Failed to stop VM: {result.Stderr.Trim()}",
+            $"Exit code: {result.ExitCode}");
+    }
+
+    public async Task<VmResult> PauseAsync(CancellationToken ct = default)
+    {
+        var result = await RunVmrunAsync(
+            $"-T ws pause \"{_vmxPath}\"",
+            TimeSpan.FromSeconds(_timeouts.VmPauseResumeSeconds), ct);
+
+        if (result.Success)
+            return VmResult.Ok("VM paused.");
+
+        return VmResult.Failed($"Failed to pause VM: {result.Stderr.Trim()}");
+    }
+
+    public async Task<VmResult> UnpauseAsync(CancellationToken ct = default)
+    {
+        var result = await RunVmrunAsync(
+            $"-T ws unpause \"{_vmxPath}\"",
+            TimeSpan.FromSeconds(_timeouts.VmPauseResumeSeconds), ct);
+
+        if (result.Success)
+            return VmResult.Ok("VM resumed.");
+
+        return VmResult.Failed($"Failed to unpause VM: {result.Stderr.Trim()}");
+    }
+
+    public async Task<VmResult> ResetAsync(bool hard = false, CancellationToken ct = default)
+    {
+        var mode = hard ? "hard" : "soft";
+        var result = await RunVmrunAsync(
+            $"-T ws reset \"{_vmxPath}\" {mode}",
+            TimeSpan.FromSeconds(_timeouts.VmStartSeconds), ct);
+
+        if (result.Success)
+            return VmResult.Ok($"VM reset ({mode}).");
+
+        return VmResult.Failed($"Failed to reset VM: {result.Stderr.Trim()}");
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  SNAPSHOT OPERATIONS
+    // ═══════════════════════════════════════════════════════════════
+
+    public async Task<VmResult> SnapshotCreateAsync(string name, CancellationToken ct = default)
+    {
+        var result = await RunVmrunAsync(
+            $"-T ws snapshot \"{_vmxPath}\" \"{name}\"",
+            TimeSpan.FromSeconds(_timeouts.VmSnapshotCreateSeconds), ct);
+
+        if (result.Success)
+            return VmResult.Ok($"Snapshot '{name}' created.");
+
+        return VmResult.Failed($"Failed to create snapshot: {result.Stderr.Trim()}");
+    }
+
+    public async Task<VmResult> SnapshotRestoreAsync(string name, CancellationToken ct = default)
+    {
+        var result = await RunVmrunAsync(
+            $"-T ws revertToSnapshot \"{_vmxPath}\" \"{name}\"",
+            TimeSpan.FromSeconds(_timeouts.VmSnapshotRestoreSeconds), ct);
+
+        if (result.Success)
+            return VmResult.Ok($"Snapshot '{name}' restored.");
+
+        return VmResult.Failed($"Failed to restore snapshot: {result.Stderr.Trim()}");
+    }
+
+    public async Task<VmResult> SnapshotDeleteAsync(string name, CancellationToken ct = default)
+    {
+        var result = await RunVmrunAsync(
+            $"-T ws deleteSnapshot \"{_vmxPath}\" \"{name}\"",
+            TimeSpan.FromSeconds(_timeouts.VmSnapshotRestoreSeconds), ct);
+
+        if (result.Success)
+            return VmResult.Ok($"Snapshot '{name}' deleted.");
+
+        return VmResult.Failed($"Failed to delete snapshot: {result.Stderr.Trim()}");
+    }
+
+    public async Task<SnapshotListResult> SnapshotListAsync(CancellationToken ct = default)
+    {
+        var result = await RunVmrunAsync(
+            $"-T ws listSnapshots \"{_vmxPath}\"",
+            TimeSpan.FromSeconds(_timeouts.VmToolsCheckSeconds), ct);
+
+        if (!result.Success)
+            return SnapshotListResult.Failed($"Failed to list snapshots: {result.Stderr.Trim()}");
+
+        // Parse output: first line is "Total snapshots: N", then one snapshot name per line
+        var lines = result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var snapshots = new List<string>();
+        foreach (var line in lines)
+        {
+            if (line.StartsWith("Total snapshots:", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!string.IsNullOrWhiteSpace(line))
+                snapshots.Add(line);
+        }
+
+        return SnapshotListResult.Ok(snapshots);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  STATE QUERIES
+    // ═══════════════════════════════════════════════════════════════
+
+    public async Task<VmPowerState> GetPowerStateAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            // vmrun list returns all running VMs
+            var result = await RunVmrunAsync(
+                "-T ws list",
+                TimeSpan.FromSeconds(_timeouts.VmToolsCheckSeconds), ct);
+
+            if (!result.Success)
+            {
+                _logger.LogWarning("vmrun list failed: {Stderr}", result.Stderr);
+                return VmPowerState.Unknown;
+            }
+
+            // Check if our VMX is in the list of running VMs
+            // vmrun list output: "Total running VMs: N\npath1\npath2\n..."
+            var vmxNormalized = _vmxPath.Replace('/', '\\').TrimEnd('\\');
+            var isRunning = result.Stdout
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Any(line => !line.StartsWith("Total running VMs:") &&
+                             line.Replace('/', '\\').TrimEnd('\\')
+                                 .Equals(vmxNormalized, StringComparison.OrdinalIgnoreCase));
+
+            return isRunning ? VmPowerState.Running : VmPowerState.Off;
+        }
+        catch (TimeoutException)
+        {
+            _logger.LogWarning("vmrun list timed out");
+            return VmPowerState.Unknown;
+        }
+    }
+
+    public async Task<bool> AreToolsRunningAsync(TimeSpan? timeout = null, CancellationToken ct = default)
+    {
+        // vmrun checkToolsState returns "running", "installed", or "unknown"
+        // This can HANG if the guest is kernel-broken, so we use a short timeout.
+        timeout ??= TimeSpan.FromSeconds(_timeouts.VmToolsCheckSeconds);
+        try
+        {
+            var result = await RunVmrunAsync(
+                $"-T ws checkToolsState \"{_vmxPath}\"",
+                timeout.Value, ct);
+            return result.Stdout.Trim().Equals("running", StringComparison.OrdinalIgnoreCase);
+        }
+        catch (TimeoutException)
+        {
+            return false; // Tools not responding
+        }
+    }
+
+    public async Task<string?> GetGuestIpAddressAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            var result = await RunVmrunAsync(
+                $"-T ws getGuestIPAddress \"{_vmxPath}\"",
+                TimeSpan.FromSeconds(_timeouts.VmGetIpSeconds), ct);
+
+            if (result.Success)
+            {
+                var ip = result.Stdout.Trim();
+                // Validate it looks like an IP
+                if (System.Net.IPAddress.TryParse(ip, out _))
+                    return ip;
+            }
+
+            return null;
+        }
+        catch (TimeoutException)
+        {
+            return null;
+        }
+    }
+
+    public async Task<VmResult> CaptureScreenAsync(string outputPath, CancellationToken ct = default)
+    {
+        // Ensure output directory exists
+        var dir = Path.GetDirectoryName(outputPath);
+        if (dir != null && !Directory.Exists(dir))
+            Directory.CreateDirectory(dir);
+
+        var result = await RunVmrunAsync(
+            $"-T ws captureScreen \"{_vmxPath}\" \"{outputPath}\"",
+            TimeSpan.FromSeconds(_timeouts.VmScreenshotSeconds), ct);
+
+        if (result.Success)
+            return VmResult.Ok($"Screenshot saved to {outputPath}");
+
+        return VmResult.Failed($"Failed to capture screen: {result.Stderr.Trim()}");
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  GUEST OPERATIONS (used by GuestExecManager)
+    // ═══════════════════════════════════════════════════════════════
+
+    public async Task<ProcessResult> RunProgramInGuestAsync(
+        string program, string arguments = "", bool interactive = false,
+        TimeSpan? timeout = null, CancellationToken ct = default)
+    {
+        timeout ??= TimeSpan.FromSeconds(_timeouts.GuestCommandSeconds);
+        var interactiveArg = interactive ? "-interactive " : "";
+        return await RunVmrunAsync(
+            $"-T ws -gu \"{_guestUser}\" -gp \"{_guestPass}\" " +
+            $"runProgramInGuest \"{_vmxPath}\" {interactiveArg}\"{program}\" {arguments}",
+            timeout.Value, ct);
+    }
+
+    public async Task<ProcessResult> RunScriptInGuestAsync(
+        string interpreter, string scriptText,
+        TimeSpan? timeout = null, CancellationToken ct = default)
+    {
+        timeout ??= TimeSpan.FromSeconds(_timeouts.GuestCommandSeconds);
+        return await RunVmrunAsync(
+            $"-T ws -gu \"{_guestUser}\" -gp \"{_guestPass}\" " +
+            $"runScriptInGuest \"{_vmxPath}\" \"{interpreter}\" \"{scriptText}\"",
+            timeout.Value, ct);
+    }
+
+    public async Task<ProcessResult> CopyFileToGuestAsync(
+        string hostPath, string guestPath, CancellationToken ct = default)
+    {
+        return await RunVmrunAsync(
+            $"-T ws -gu \"{_guestUser}\" -gp \"{_guestPass}\" " +
+            $"copyFileFromHostToGuest \"{_vmxPath}\" \"{hostPath}\" \"{guestPath}\"",
+            TimeSpan.FromSeconds(_timeouts.GuestFileTransferSeconds), ct);
+    }
+
+    public async Task<ProcessResult> CopyFileFromGuestAsync(
+        string guestPath, string hostPath, CancellationToken ct = default)
+    {
+        return await RunVmrunAsync(
+            $"-T ws -gu \"{_guestUser}\" -gp \"{_guestPass}\" " +
+            $"copyFileFromGuestToHost \"{_vmxPath}\" \"{guestPath}\" \"{hostPath}\"",
+            TimeSpan.FromSeconds(_timeouts.GuestFileTransferSeconds), ct);
+    }
+
+    public async Task<ProcessResult> ListProcessesInGuestAsync(CancellationToken ct = default)
+    {
+        return await RunVmrunAsync(
+            $"-T ws -gu \"{_guestUser}\" -gp \"{_guestPass}\" " +
+            $"listProcessesInGuest \"{_vmxPath}\"",
+            TimeSpan.FromSeconds(_timeouts.GuestListProcessesSeconds), ct);
+    }
+
+    public async Task<ProcessResult> KillProcessInGuestAsync(uint pid, CancellationToken ct = default)
+    {
+        return await RunVmrunAsync(
+            $"-T ws -gu \"{_guestUser}\" -gp \"{_guestPass}\" " +
+            $"killProcessInGuest \"{_vmxPath}\" {pid}",
+            TimeSpan.FromSeconds(_timeouts.GuestKillProcessSeconds), ct);
+    }
+
+    public async Task<ProcessResult> FileExistsInGuestAsync(string guestPath, CancellationToken ct = default)
+    {
+        return await RunVmrunAsync(
+            $"-T ws -gu \"{_guestUser}\" -gp \"{_guestPass}\" " +
+            $"fileExistsInGuest \"{_vmxPath}\" \"{guestPath}\"",
+            TimeSpan.FromSeconds(_timeouts.VmToolsCheckSeconds), ct);
+    }
+
+    public async Task<ProcessResult> CreateDirectoryInGuestAsync(string guestPath, CancellationToken ct = default)
+    {
+        return await RunVmrunAsync(
+            $"-T ws -gu \"{_guestUser}\" -gp \"{_guestPass}\" " +
+            $"createDirectoryInGuest \"{_vmxPath}\" \"{guestPath}\"",
+            TimeSpan.FromSeconds(_timeouts.VmToolsCheckSeconds), ct);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  INTERNAL: vmrun process execution
+    // ═══════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Run vmrun with timeout. Captures stdout/stderr. Kills on timeout.
+    /// </summary>
+    internal async Task<ProcessResult> RunVmrunAsync(
+        string args, TimeSpan timeout, CancellationToken ct = default)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cts.CancelAfter(timeout);
+
+        _logger.LogDebug("vmrun {Args}", args);
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = _vmrunPath,
+            Arguments = args,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        using var process = new Process { StartInfo = psi };
+        process.Start();
+
+        var stdoutTask = process.StandardOutput.ReadToEndAsync(cts.Token);
+        var stderrTask = process.StandardError.ReadToEndAsync(cts.Token);
+
+        try
+        {
+            await process.WaitForExitAsync(cts.Token);
+            var stdout = await stdoutTask;
+            var stderr = await stderrTask;
+
+            _logger.LogDebug("vmrun exit={ExitCode} stdout={Stdout} stderr={Stderr}",
+                process.ExitCode, stdout.Length > 200 ? stdout[..200] + "..." : stdout, stderr);
+
+            return new ProcessResult(process.ExitCode, stdout, stderr);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // Our timeout fired, not the caller's cancellation
+            try { process.Kill(entireProcessTree: true); } catch { }
+            throw new TimeoutException(
+                $"vmrun timed out after {timeout.TotalSeconds}s. " +
+                $"Command: vmrun {args.Split(' ').FirstOrDefault()}...");
+        }
+    }
+}

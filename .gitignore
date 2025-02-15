@@ -1,0 +1,35 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+*.cache
+*.dll
+*.exe
+*.pdb
+.vs/
+
+## IDE
+.idea/
+*.swp
+*~
+
+## Build
+publish/
+out/
+
+## NuGet
+*.nupkg
+packages/
+
+## Test results
+TestResults/
+
+## Temp files
+*.tmp
+stdout.txt
+stderr.txt
+dotnet-install.ps1
+
+## Secrets - do NOT commit appsettings with real credentials
+src/WinDbgMCP.Server/appsettings.json

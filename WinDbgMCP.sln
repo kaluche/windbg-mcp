@@ -1,0 +1,34 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{0DACF645-F5E7-4A64-AB98-91783B7867DF}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "WinDbgMCP.Server", "src\WinDbgMCP.Server\WinDbgMCP.Server.csproj", "{9CC4A42E-A4CB-4E96-8ADA-6432D326775B}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "WinDbgMCP.Tests", "src\WinDbgMCP.Tests\WinDbgMCP.Tests.csproj", "{7AD5D8C8-8498-4896-9F02-0376A9ECEA05}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{9CC4A42E-A4CB-4E96-8ADA-6432D326775B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9CC4A42E-A4CB-4E96-8ADA-6432D326775B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9CC4A42E-A4CB-4E96-8ADA-6432D326775B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9CC4A42E-A4CB-4E96-8ADA-6432D326775B}.Release|Any CPU.Build.0 = Release|Any CPU
+		{7AD5D8C8-8498-4896-9F02-0376A9ECEA05}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7AD5D8C8-8498-4896-9F02-0376A9ECEA05}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7AD5D8C8-8498-4896-9F02-0376A9ECEA05}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7AD5D8C8-8498-4896-9F02-0376A9ECEA05}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{9CC4A42E-A4CB-4E96-8ADA-6432D326775B} = {0DACF645-F5E7-4A64-AB98-91783B7867DF}
+		{7AD5D8C8-8498-4896-9F02-0376A9ECEA05} = {0DACF645-F5E7-4A64-AB98-91783B7867DF}
+	EndGlobalSection
+EndGlobal
