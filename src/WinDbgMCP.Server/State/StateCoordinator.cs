@@ -33,6 +33,17 @@ public sealed class StateCoordinator
     public Func<bool>? IsDbgEngConnected { get; set; }
     public Func<int>? GetPendingEventCount { get; set; }
 
+    // User-mode debug state delegates
+    public Func<bool>? IsFridaAttached { get; set; }
+    public Func<string?>? GetFridaTargetName { get; set; }
+    public Func<bool>? IsDbgsrvConnected { get; set; }
+    public Func<uint?>? GetDbgsrvAttachedPid { get; set; }
+
+    // Cleanup delegates for snapshot restore
+    public Action? CleanupKdSession { get; set; }
+    public Action? CleanupFridaSession { get; set; }
+    public Action? CleanupDbgsrvSession { get; set; }
+
     public StateCoordinator(ServerConfig config, ILogger<StateCoordinator> logger)
     {
         _config = config;
@@ -58,8 +69,8 @@ public sealed class StateCoordinator
                 "vm_stop" => RequireVmNotOff(warnIfKdAttached: true),
                 "vm_pause" => RequireVmRunning(warnIfKdAttached: true),
                 "vm_resume" => RequireVmPaused(),
-                "vm_snapshot_create" => null, // Always allowed
                 "vm_snapshot_restore" => null, // Always allowed (but resets everything)
+                "vm_set_target" => null,       // Always allowed (resets everything)
                 "vm_screenshot" => RequireVmNotOff(),
                 "vm_snapshot_list" => null, // Always allowed
 
@@ -81,7 +92,7 @@ public sealed class StateCoordinator
 
                 // --- User-mode debug tools ---
                 "umd_frida_attach" => RequireGuestOpsAvailable(),
-                "umd_frida" => RequireFridaAttached(),
+                "umd_frida" => RequireGuestOpsAvailable(),
                 "umd_dbgsrv_connect" => RequireGuestOpsAvailable(),
                 "umd_dbgsrv_execute" => RequireDbgsrvConnected(),
                 "umd_ttd" => RequireGuestOpsAvailable(),
@@ -131,7 +142,7 @@ public sealed class StateCoordinator
             && !_bsodCheckedForCurrentBreak)
         {
             _bsodCheckedForCurrentBreak = true;
-            // TODO: DetectBugcheckAsync() will be wired in Phase 2
+            // BSOD detection happens in KernelDebugTools (kd_break, kd_wait_for_event)
         }
         else if (_state.KdExecStatus != DebugExecutionStatus.Break)
         {
@@ -140,8 +151,40 @@ public sealed class StateCoordinator
             _bsodCheckedForCurrentBreak = false;
         }
 
+        // 2.7 User-mode debug state
+        if (IsFridaAttached?.Invoke() == true)
+        {
+            _state.FridaState = new FridaSessionState
+            {
+                Connected = true,
+                AttachedPid = null, // Frida tracks by name primarily
+                ProcessName = GetFridaTargetName?.Invoke()
+            };
+        }
+        else
+        {
+            _state.FridaState = null;
+        }
+
+        if (IsDbgsrvConnected?.Invoke() == true)
+        {
+            var pid = GetDbgsrvAttachedPid?.Invoke();
+            _state.DbgsrvState = new DbgsrvSessionState
+            {
+                Connected = true,
+                AttachedPid = pid.HasValue ? (int)pid.Value : null
+            };
+        }
+        else
+        {
+            _state.DbgsrvState = null;
+        }
+
         // 3. VM power state — only refresh if stale (>2 seconds old)
-        if (DateTime.UtcNow - _lastVmStateRefresh > TimeSpan.FromSeconds(2))
+        // Skip refresh if state is Paused — vmrun list can't distinguish paused
+        // from running, so we'd overwrite the manually-tracked Paused state.
+        if (_state.VmPower != VmPowerState.Paused &&
+            DateTime.UtcNow - _lastVmStateRefresh > TimeSpan.FromSeconds(2))
         {
             if (GetVmPowerStateAsync != null)
             {
@@ -189,14 +232,21 @@ public sealed class StateCoordinator
     }
 
     /// <summary>
-    /// Force a full state reset (e.g., after snapshot restore).
+    /// Force a full state reset (e.g., after snapshot restore or VM target switch).
     /// </summary>
-    public void ResetAllState()
+    /// <param name="vmPowerState">Actual VM power state after the reset. Defaults to Running.</param>
+    /// <param name="vmxPath">New VMX path if the target VM changed. Defaults to config value.</param>
+    public void ResetAllState(VmPowerState vmPowerState = VmPowerState.Running, string? vmxPath = null)
     {
+        // Clean up active sessions before resetting state
+        try { CleanupKdSession?.Invoke(); } catch { }
+        try { CleanupFridaSession?.Invoke(); } catch { }
+        try { CleanupDbgsrvSession?.Invoke(); } catch { }
+
         _state = new SystemState
         {
-            VmxPath = _config.Vm.VmxPath,
-            VmPower = VmPowerState.Running, // VMware restores to running
+            VmxPath = vmxPath ?? _config.Vm.VmxPath,
+            VmPower = vmPowerState,
             VmTools = VmToolsState.Unknown, // Need to re-probe
             KdConnected = false,
             KdExecStatus = DebugExecutionStatus.NoDebuggee,
@@ -232,6 +282,34 @@ public sealed class StateCoordinator
         _state.KdWaitPending = false;
         _state.IsBugcheck = false;
         _state.BugcheckCode = null;
+    }
+
+    /// <summary>
+    /// Update VM power state after a successful pause.
+    /// </summary>
+    public void SetVmPaused()
+    {
+        _state.VmPower = VmPowerState.Paused;
+        _state.GuestOpsAvailable = false;
+        _lastVmStateRefresh = DateTime.UtcNow; // Prevent immediate overwrite by refresh
+    }
+
+    /// <summary>
+    /// Update VM power state after a successful resume from pause.
+    /// </summary>
+    public void SetVmResumed()
+    {
+        _state.VmPower = VmPowerState.Running;
+        _lastVmStateRefresh = DateTime.UtcNow; // Prevent immediate overwrite by refresh
+    }
+
+    /// <summary>
+    /// Mark that a BSOD/bugcheck was detected.
+    /// </summary>
+    public void SetBsodDetected(string? bugcheckCode)
+    {
+        _state.IsBugcheck = true;
+        _state.BugcheckCode = bugcheckCode;
     }
 
     // ═══════════════════════════════════════════════════════════════

@@ -1,35 +1,41 @@
-## .NET
+# .NET build output
 bin/
 obj/
-*.user
-*.suo
-*.cache
-*.dll
-*.exe
-*.pdb
-.vs/
-
-## IDE
-.idea/
-*.swp
-*~
-
-## Build
 publish/
-out/
 
-## NuGet
+# NuGet
 *.nupkg
-packages/
+**/packages/
 
-## Test results
-TestResults/
+# IDE
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
 
-## Temp files
-*.tmp
-stdout.txt
-stderr.txt
-dotnet-install.ps1
+# Rider
+*.sln.iml
 
-## Secrets - do NOT commit appsettings with real credentials
+# OS
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# Secrets — appsettings.json contains VM creds, KDNET keys, passwords
 src/WinDbgMCP.Server/appsettings.json
+
+# MCP client config (contains local paths)
+.mcp.json
+
+# Debug logs
+*.log
+
+# Python utility scripts (dev-only, not part of the project)
+*.py
+
+# Frida temp scripts
+frida_script_*.js

@@ -1,5 +1,7 @@
 using System.ComponentModel;
 using ModelContextProtocol.Server;
+using WinDbgMCP.Server.Configuration;
+using WinDbgMCP.Server.KernelDebug;
 using WinDbgMCP.Server.State;
 using WinDbgMCP.Server.Vmware;
 
@@ -14,7 +16,7 @@ public static class VmTools
     public static async Task<string> VmStart(
         StateCoordinator state,
         VmwareManager vmware,
-        [Description("If true, start VM without a visible window (default: true)")] bool headless = true,
+        [Description("If true, start VM without a visible window (default: false)")] bool headless = false,
         CancellationToken ct = default)
     {
         var precheck = await state.ValidatePreconditionsAsync("vm_start");
@@ -85,6 +87,7 @@ public static class VmTools
             if (!result.Success)
                 return $"vm_pause failed: {result.Message}";
 
+            state.SetVmPaused();
             return warning + result.Message;
         }
         catch (TimeoutException)
@@ -109,6 +112,7 @@ public static class VmTools
             if (!result.Success)
                 return $"vm_resume failed: {result.Message}";
 
+            state.SetVmResumed();
             return result.Message;
         }
         catch (TimeoutException)
@@ -117,58 +121,131 @@ public static class VmTools
         }
     }
 
-    [McpServerTool(Name = "vm_snapshot_create"), Description(
-        "Create a named snapshot of the VM. Works in any VM state.")]
-    public static async Task<string> VmSnapshotCreate(
-        StateCoordinator state,
-        VmwareManager vmware,
-        [Description("Name for the snapshot")] string name,
-        CancellationToken ct = default)
-    {
-        var precheck = await state.ValidatePreconditionsAsync("vm_snapshot_create");
-        if (precheck != null) return precheck.ErrorMessage!;
-
-        try
-        {
-            var result = await vmware.SnapshotCreateAsync(name, ct);
-            if (!result.Success)
-                return $"vm_snapshot_create failed: {result.Message}";
-
-            return result.Message;
-        }
-        catch (TimeoutException)
-        {
-            return ErrorMessages.OperationTimedOut("vm_snapshot_create", 120);
-        }
-    }
-
     [McpServerTool(Name = "vm_snapshot_restore"), Description(
-        "Restore a named snapshot. WARNING: This DESTROYS ALL debug sessions " +
-        "(kernel debugger, Frida, dbgsrv). You must reconnect after restoring.")]
+        "Restore a named snapshot. Destroys all debug sessions (Frida, dbgsrv). " +
+        "If the kernel debugger was connected, it is cleanly disconnected before restore " +
+        "and automatically reconnected afterwards — no manual kd_connect needed.")]
     public static async Task<string> VmSnapshotRestore(
         StateCoordinator state,
         VmwareManager vmware,
+        DbgEngManager dbgEng,
+        ServerConfig config,
         [Description("Name of the snapshot to restore")] string name,
         CancellationToken ct = default)
     {
         var precheck = await state.ValidatePreconditionsAsync("vm_snapshot_restore");
         if (precheck != null) return precheck.ErrorMessage!;
 
+        // Remember whether KD was connected so we can reconnect after restore
+        var wasKdConnected = state.State.KdConnected;
+
         try
         {
+            // Step 1: Clean KD disconnect BEFORE restore while KDNET is still alive.
+            // This avoids the race condition where the snapshot restore kills the
+            // KDNET connection while DbgEng is mid-operation on its dedicated thread.
+            if (wasKdConnected)
+            {
+                try
+                {
+                    await dbgEng.DisconnectAsync();
+                }
+                catch
+                {
+                    // Best-effort — if disconnect fails the restore still proceeds
+                }
+                state.SetKdDisconnected();
+            }
+
+            // Step 2: Restore the snapshot
             var result = await vmware.SnapshotRestoreAsync(name, ct);
             if (!result.Success)
                 return $"vm_snapshot_restore failed: {result.Message}";
 
-            // Reset ALL state
-            state.ResetAllState();
+            // Step 3: Check power state and auto-start if needed
+            var powerState = await vmware.GetPowerStateAsync(ct);
+            if (powerState != VmPowerState.Running)
+            {
+                var startResult = await vmware.StartAsync(headless: false, ct);
+                if (startResult.Success)
+                    powerState = VmPowerState.Running;
+            }
 
-            return $"Snapshot '{name}' restored. " + ErrorMessages.SnapshotRestoredWarning;
+            // Step 4: Reset all state (safe — KD already disconnected above)
+            state.ResetAllState(powerState);
+
+            var statusMsg = powerState == VmPowerState.Running
+                ? $"Snapshot '{name}' restored and VM is running."
+                : $"Snapshot '{name}' restored but VM is {powerState}. Call vm_start to start it.";
+
+            // Step 5: If KD was connected before, attempt transparent reconnect
+            if (wasKdConnected && powerState == VmPowerState.Running)
+            {
+                try
+                {
+                    var reconnectResult = await dbgEng.ConnectKernelAsync(ct: ct);
+                    var transport = config.KernelDebug.Transport.Equals("kdnet", StringComparison.OrdinalIgnoreCase)
+                        ? KdTransport.KDNET
+                        : KdTransport.Serial;
+                    state.SetKdConnected(transport);
+                    return statusMsg + $" Kernel debugger reconnected automatically. {reconnectResult}";
+                }
+                catch (Exception ex)
+                {
+                    return statusMsg + $" Auto-reconnect failed: {ex.Message} " +
+                           "Call kd_connect manually when the VM is ready.";
+                }
+            }
+
+            return statusMsg + " " + ErrorMessages.SnapshotRestoredWarning;
         }
         catch (TimeoutException)
         {
             return ErrorMessages.OperationTimedOut("vm_snapshot_restore", 60);
         }
+    }
+
+    [McpServerTool(Name = "vm_set_target"), Description(
+        "Switch the active VM target at runtime. " +
+        "All VM, guest, and snapshot operations will target the new VM after this call. " +
+        "If the kernel debugger is connected, it is cleanly disconnected first. " +
+        "Note: kd_connect uses its own connection string — this only affects guest/VM operations.")]
+    public static async Task<string> VmSetTarget(
+        StateCoordinator state,
+        VmwareManager vmware,
+        DbgEngManager dbgEng,
+        [Description("Absolute path to the .vmx file of the target VM")] string vmxPath,
+        [Description("Guest OS username")] string guestUsername,
+        [Description("Guest OS password")] string guestPassword,
+        [Description("VM encryption password (leave empty if VM is not encrypted)")] string vmPassword = "",
+        CancellationToken ct = default)
+    {
+        var precheck = await state.ValidatePreconditionsAsync("vm_set_target");
+        if (precheck != null) return precheck.ErrorMessage!;
+
+        var wasKdConnected = state.State.KdConnected;
+
+        // Cleanly disconnect KD if connected — it was pointing at the old VM
+        if (wasKdConnected)
+        {
+            try { await dbgEng.DisconnectAsync(); } catch { }
+            state.SetKdDisconnected();
+        }
+
+        // Switch the target
+        vmware.UpdateTarget(vmxPath, guestUsername, guestPassword, vmPassword);
+
+        // Reset all state — power state of the new VM is unknown until we check
+        var powerState = await vmware.GetPowerStateAsync(ct);
+        state.ResetAllState(powerState, vmxPath);
+
+        var kdNote = wasKdConnected
+            ? " Previous kernel debugger session was disconnected."
+            : "";
+
+        return $"VM target switched to '{vmxPath}' (user: {guestUsername}). " +
+               $"VM is currently {powerState}.{kdNote} " +
+               "Use vm_start if the VM is off, or proceed with guest/VM operations if it is running.";
     }
 
     [McpServerTool(Name = "vm_snapshot_list"), Description(
@@ -199,29 +276,4 @@ public static class VmTools
         }
     }
 
-    [McpServerTool(Name = "vm_screenshot"), Description(
-        "Capture a screenshot of the VM display. Useful for checking guest OS state " +
-        "(boot screen, BSOD, login screen, etc).")]
-    public static async Task<string> VmScreenshot(
-        StateCoordinator state,
-        VmwareManager vmware,
-        [Description("Host path to save the screenshot PNG")] string outputPath = @"C:\MCP_Logs\screenshot.png",
-        CancellationToken ct = default)
-    {
-        var precheck = await state.ValidatePreconditionsAsync("vm_screenshot");
-        if (precheck != null) return precheck.ErrorMessage!;
-
-        try
-        {
-            var result = await vmware.CaptureScreenAsync(outputPath, ct);
-            if (!result.Success)
-                return $"vm_screenshot failed: {result.Message}";
-
-            return result.Message;
-        }
-        catch (TimeoutException)
-        {
-            return ErrorMessages.OperationTimedOut("vm_screenshot", 10);
-        }
-    }
 }

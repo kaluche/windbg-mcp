@@ -17,6 +17,10 @@ public sealed class VmConfig
 {
     public string VmxPath { get; set; } = string.Empty;
     public string VmrunPath { get; set; } = @"C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe";
+    /// <summary>
+    /// VM encryption password (for encrypted VMs). Used as -vp flag in vmrun.
+    /// </summary>
+    public string VmPassword { get; set; } = string.Empty;
     public string GuestUsername { get; set; } = string.Empty;
     public string GuestPassword { get; set; } = string.Empty;
     public bool Headless { get; set; } = true;
@@ -48,14 +52,32 @@ public sealed class GuestConfig
 {
     public int FridaPort { get; set; } = 27042;
     public int DbgsrvPort { get; set; } = 5064;
-    public int X64DbgAutomatePort { get; set; } = 27043;
 }
 
 public sealed class SecurityConfig
 {
-    public string QuarantineDir { get; set; } = @"C:\MCP_Quarantine";
-    public int MaxFileTransferSizeMB { get; set; } = 500;
-    public string LogDir { get; set; } = @"C:\MCP_Logs";
+    /// <summary>
+    /// Snapshot deletion is DISABLED by default. Must be explicitly enabled.
+    /// </summary>
+    public bool SnapshotDeleteEnabled { get; set; } = false;
+
+    /// <summary>
+    /// Snapshots in this list cannot be deleted or overwritten.
+    /// Acts as a safety net to protect known-good states.
+    /// </summary>
+    public List<string> ProtectedSnapshots { get; set; } = new();
+
+    /// <summary>
+    /// If true, refuse to delete/restore-over when only one snapshot remains.
+    /// Prevents accidentally losing the last recovery point. Default: true.
+    /// </summary>
+    public bool PreventLastSnapshotDeletion { get; set; } = true;
+
+    /// <summary>
+    /// Default snapshot name for recovery/restore operations.
+    /// This is the "known-good" snapshot that the LLM should revert to when needed.
+    /// </summary>
+    public string DefaultSnapshotName { get; set; } = string.Empty;
 }
 
 public sealed class TimeoutConfig

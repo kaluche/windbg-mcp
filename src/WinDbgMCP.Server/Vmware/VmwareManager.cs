@@ -16,21 +16,30 @@ namespace WinDbgMCP.Server.Vmware;
 public sealed class VmwareManager
 {
     private readonly string _vmrunPath;
-    private readonly string _vmxPath;
-    private readonly string _guestUser;
-    private readonly string _guestPass;
+    private string _vmxPath;
+    private string _vmPassword;
+    private string _guestUser;
+    private string _guestPass;
     private readonly TimeoutConfig _timeouts;
+    private readonly SecurityConfig _security;
     private readonly ILogger<VmwareManager> _logger;
 
+    // Serialize vmrun calls — VMware doesn't handle concurrent vmrun processes well
+    // for the same VM. Concurrent calls can corrupt internal state and cause timeouts.
+    private readonly SemaphoreSlim _vmrunLock = new(1, 1);
+
     public string VmxPath => _vmxPath;
+    public string GuestUser => _guestUser;
 
     public VmwareManager(ServerConfig config, ILogger<VmwareManager> logger)
     {
         _vmrunPath = config.Vm.VmrunPath;
         _vmxPath = config.Vm.VmxPath;
+        _vmPassword = config.Vm.VmPassword;
         _guestUser = config.Vm.GuestUsername;
         _guestPass = config.Vm.GuestPassword;
         _timeouts = config.Timeouts;
+        _security = config.Security;
         _logger = logger;
 
         // Validate vmrun exists at startup
@@ -41,6 +50,19 @@ public sealed class VmwareManager
                 "Install VMware Workstation Pro and verify the vmrunPath in appsettings.json.",
                 _vmrunPath);
         }
+    }
+
+    /// <summary>
+    /// Switch the active VM target at runtime.
+    /// All subsequent VM and guest operations will target the new VM.
+    /// </summary>
+    public void UpdateTarget(string vmxPath, string guestUser, string guestPass, string vmPassword = "")
+    {
+        _vmxPath = vmxPath;
+        _guestUser = guestUser;
+        _guestPass = guestPass;
+        _vmPassword = vmPassword;
+        _logger.LogInformation("VM target updated: {VmxPath} (user: {User})", vmxPath, guestUser);
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -144,6 +166,27 @@ public sealed class VmwareManager
 
     public async Task<VmResult> SnapshotDeleteAsync(string name, CancellationToken ct = default)
     {
+        // Safeguard 1: Snapshot deletion must be explicitly enabled
+        if (!_security.SnapshotDeleteEnabled)
+            return VmResult.Failed(
+                "Snapshot deletion is DISABLED. Set Security.SnapshotDeleteEnabled=true in appsettings.json to allow.");
+
+        // Safeguard 2: Protected snapshots cannot be deleted
+        if (_security.ProtectedSnapshots.Any(s => s.Equals(name, StringComparison.OrdinalIgnoreCase)))
+            return VmResult.Failed(
+                $"Snapshot '{name}' is PROTECTED and cannot be deleted. " +
+                "Remove it from Security.ProtectedSnapshots in appsettings.json to allow.");
+
+        // Safeguard 3: Refuse to delete the last snapshot
+        if (_security.PreventLastSnapshotDeletion)
+        {
+            var listResult = await SnapshotListAsync(ct);
+            if (listResult.Success && listResult.Snapshots.Count <= 1)
+                return VmResult.Failed(
+                    "REFUSED: This is the LAST snapshot. Deleting it would leave no recovery point. " +
+                    "Set Security.PreventLastSnapshotDeletion=false to override (not recommended).");
+        }
+
         var result = await RunVmrunAsync(
             $"-T ws deleteSnapshot \"{_vmxPath}\" \"{name}\"",
             TimeSpan.FromSeconds(_timeouts.VmSnapshotRestoreSeconds), ct);
@@ -264,7 +307,7 @@ public sealed class VmwareManager
             Directory.CreateDirectory(dir);
 
         var result = await RunVmrunAsync(
-            $"-T ws captureScreen \"{_vmxPath}\" \"{outputPath}\"",
+            $"-T ws -gu \"{_guestUser}\" -gp \"{_guestPass}\" captureScreen \"{_vmxPath}\" \"{outputPath}\"",
             TimeSpan.FromSeconds(_timeouts.VmScreenshotSeconds), ct);
 
         if (result.Success)
@@ -360,8 +403,37 @@ public sealed class VmwareManager
     internal async Task<ProcessResult> RunVmrunAsync(
         string args, TimeSpan timeout, CancellationToken ct = default)
     {
+        // Serialize vmrun calls — VMware can't handle concurrent vmrun processes
+        // for the same VM. Without this, a slow captureScreen can corrupt state
+        // and cause all subsequent vmrun calls to time out.
+        // Use a timeout on semaphore acquisition to avoid indefinite blocking.
+        var lockTimeout = timeout + TimeSpan.FromSeconds(10);
+        if (!await _vmrunLock.WaitAsync(lockTimeout, ct))
+        {
+            throw new TimeoutException(
+                $"vmrun queue timeout — another vmrun command has been running for >{lockTimeout.TotalSeconds}s. " +
+                "VMware may be stuck. Try vm_snapshot_restore to recover.");
+        }
+
+        try
+        {
+            return await RunVmrunCoreAsync(args, timeout, ct);
+        }
+        finally
+        {
+            _vmrunLock.Release();
+        }
+    }
+
+    private async Task<ProcessResult> RunVmrunCoreAsync(
+        string args, TimeSpan timeout, CancellationToken ct)
+    {
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         cts.CancelAfter(timeout);
+
+        // Prepend VM encryption password if configured
+        if (!string.IsNullOrEmpty(_vmPassword))
+            args = $"-vp \"{_vmPassword}\" {args}";
 
         _logger.LogDebug("vmrun {Args}", args);
 
@@ -394,8 +466,18 @@ public sealed class VmwareManager
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
-            // Our timeout fired, not the caller's cancellation
-            try { process.Kill(entireProcessTree: true); } catch { }
+            // Our timeout fired, not the caller's cancellation.
+            // Kill the process and wait for it to actually exit to avoid
+            // leaving orphaned vmrun processes that block future calls.
+            try
+            {
+                process.Kill(entireProcessTree: true);
+                // Wait up to 3s for the process to actually die
+                using var exitCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+                try { await process.WaitForExitAsync(exitCts.Token); } catch { }
+            }
+            catch { }
+
             throw new TimeoutException(
                 $"vmrun timed out after {timeout.TotalSeconds}s. " +
                 $"Command: vmrun {args.Split(' ').FirstOrDefault()}...");

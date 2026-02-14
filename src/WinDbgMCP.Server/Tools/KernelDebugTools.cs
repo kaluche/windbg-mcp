@@ -1,0 +1,253 @@
+using System.ComponentModel;
+using ModelContextProtocol.Server;
+using WinDbgMCP.Server.Configuration;
+using WinDbgMCP.Server.KernelDebug;
+using WinDbgMCP.Server.KernelDebug.Interop;
+using WinDbgMCP.Server.State;
+
+namespace WinDbgMCP.Server.Tools;
+
+[McpServerToolType]
+public static class KernelDebugTools
+{
+    [McpServerTool(Name = "kd_connect"), Description(
+        "Connect to the kernel debug target via KDNET or serial. " +
+        "The VM must be running with debug boot enabled. " +
+        "Target will break on connect (initial breakpoint). " +
+        "Optionally provide a raw connection string (e.g. 'net:port=50000,key=...' or 'com:pipe,port=\\\\.\\pipe\\com_1,resets=0,reconnect'); " +
+        "if omitted, connects using the defaults from appsettings.json.")]
+    public static async Task<string> KdConnect(
+        StateCoordinator state,
+        DbgEngManager dbgEng,
+        ServerConfig config,
+        [Description("Optional raw DbgEng connection string. If omitted, uses appsettings.json defaults.")] string? connectionString = null,
+        CancellationToken ct = default)
+    {
+        var precheck = await state.ValidatePreconditionsAsync("kd_connect");
+        if (precheck != null) return precheck.ErrorMessage!;
+
+        try
+        {
+            var result = await dbgEng.ConnectKernelAsync(connectionString, ct);
+
+            // Update state coordinator with actual transport type
+            KdTransport transport;
+            if (connectionString != null)
+                transport = connectionString.StartsWith("net:", StringComparison.OrdinalIgnoreCase) ? KdTransport.KDNET : KdTransport.Serial;
+            else
+                transport = config.KernelDebug.Transport.Equals("kdnet", StringComparison.OrdinalIgnoreCase) ? KdTransport.KDNET : KdTransport.Serial;
+            state.SetKdConnected(transport);
+
+            return result;
+        }
+        catch (OperationCanceledException)
+        {
+            return "kd_connect timed out. The kernel debug target did not respond within " +
+                   $"{config.Timeouts.KdConnectSeconds}s. Verify: " +
+                   "(1) VM is running with debug boot enabled (bcdedit /debug on + KDNET configured). " +
+                   "(2) The KDNET port/key matches appsettings.json. " +
+                   "(3) No other debugger is already attached. " +
+                   "(4) Host firewall allows UDP port inbound.";
+        }
+        catch (Exception ex)
+        {
+            return $"kd_connect failed: {ex.GetType().Name}: {ex.Message}";
+        }
+    }
+
+    [McpServerTool(Name = "kd_disconnect"), Description(
+        "Disconnect from the kernel debug target. " +
+        "Resumes the target before disconnecting so the VM keeps running.")]
+    public static async Task<string> KdDisconnect(
+        StateCoordinator state,
+        DbgEngManager dbgEng,
+        CancellationToken ct = default)
+    {
+        var precheck = await state.ValidatePreconditionsAsync("kd_disconnect");
+        if (precheck != null) return precheck.ErrorMessage!;
+
+        try
+        {
+            var result = await dbgEng.DisconnectAsync();
+            state.SetKdDisconnected();
+            return result;
+        }
+        catch (Exception ex)
+        {
+            // Even if disconnect throws, mark as disconnected
+            state.SetKdDisconnected();
+            return $"kd_disconnect completed with error: {ex.GetType().Name}: {ex.Message}";
+        }
+    }
+
+    [McpServerTool(Name = "kd_break"), Description(
+        "Break into a running target (equivalent to Ctrl+Break in WinDbg). " +
+        "Target must be running. After breaking, use kd_execute to inspect state.")]
+    public static async Task<string> KdBreak(
+        StateCoordinator state,
+        DbgEngManager dbgEng,
+        CancellationToken ct = default)
+    {
+        var precheck = await state.ValidatePreconditionsAsync("kd_break");
+        if (precheck != null) return precheck.ErrorMessage!;
+
+        try
+        {
+            var result = await dbgEng.BreakAsync();
+
+            // Check for BSOD after break
+            var (isBugcheck, bugcheckCode) = await dbgEng.DetectBugcheckAsync();
+            if (isBugcheck)
+            {
+                state.SetBsodDetected(bugcheckCode);
+                return result + $"\n\nWARNING: BSOD DETECTED (bugcheck {bugcheckCode}). " +
+                       "The OS has crashed. Use kd_execute('!analyze -v') to investigate. " +
+                       "Guest operations will NOT work. Use vm_snapshot_restore to recover.";
+            }
+
+            return result;
+        }
+        catch (OperationCanceledException)
+        {
+            return "kd_break timed out. The target may not be in a state where it can break.";
+        }
+        catch (Exception ex)
+        {
+            return $"kd_break failed: {ex.GetType().Name}: {ex.Message}";
+        }
+    }
+
+    [McpServerTool(Name = "kd_continue"), Description(
+        "Resume target execution (go). Returns immediately — the target starts running. " +
+        "Use kd_wait_for_event to check for breakpoint hits, or kd_break to halt again. " +
+        "Guest operations (vm_execute, vm_send_file) require the target to be running.")]
+    public static async Task<string> KdContinue(
+        StateCoordinator state,
+        DbgEngManager dbgEng,
+        CancellationToken ct = default)
+    {
+        var precheck = await state.ValidatePreconditionsAsync("kd_continue");
+        if (precheck != null) return precheck.ErrorMessage!;
+
+        try
+        {
+            return await dbgEng.ContinueAsync();
+        }
+        catch (OperationCanceledException)
+        {
+            return "kd_continue timed out.";
+        }
+        catch (Exception ex)
+        {
+            return $"kd_continue failed: {ex.GetType().Name}: {ex.Message}";
+        }
+    }
+
+    [McpServerTool(Name = "kd_step"), Description(
+        "Step one instruction. Mode 'over' steps over calls, 'into' steps into calls. " +
+        "Target must be at a breakpoint (broken). Returns the new instruction pointer and disassembly.")]
+    public static async Task<string> KdStep(
+        StateCoordinator state,
+        DbgEngManager dbgEng,
+        [Description("Step mode: 'into' (step into calls) or 'over' (step over calls, default)")] string mode = "over",
+        CancellationToken ct = default)
+    {
+        var precheck = await state.ValidatePreconditionsAsync("kd_step");
+        if (precheck != null) return precheck.ErrorMessage!;
+
+        try
+        {
+            return await dbgEng.StepAsync(mode);
+        }
+        catch (OperationCanceledException)
+        {
+            return "kd_step timed out. The target may be in an unexpected state.";
+        }
+        catch (Exception ex)
+        {
+            return $"kd_step failed: {ex.GetType().Name}: {ex.Message}";
+        }
+    }
+
+    [McpServerTool(Name = "kd_execute"), Description(
+        "Execute any WinDbg command and return output. Target must be halted (at breakpoint). " +
+        "Examples: 'k' (stack), 'r' (registers), 'lm' (modules), '!process 0 0', '!analyze -v', " +
+        "'db addr' (memory), 'u addr' (disassemble), 'bp symbol' (set breakpoint). " +
+        "Execution-control commands (g, t, p, gu, wt) are BLOCKED — use kd_continue/kd_step instead.")]
+    public static async Task<string> KdExecute(
+        StateCoordinator state,
+        DbgEngManager dbgEng,
+        [Description("WinDbg command to execute")] string command,
+        [Description("Timeout in seconds (default 30)")] int timeoutSeconds = 30,
+        CancellationToken ct = default)
+    {
+        var precheck = await state.ValidatePreconditionsAsync("kd_execute");
+        if (precheck != null) return precheck.ErrorMessage!;
+
+        // Check for blocked commands
+        var (isBlocked, blockedCmd, suggestion) = DbgEngConstants.CheckCommand(command);
+        if (isBlocked)
+        {
+            return $"BLOCKED: The command '{blockedCmd}' changes execution state and " +
+                   $"would hang the debugger if run via kd_execute. {suggestion}";
+        }
+
+        try
+        {
+            return await dbgEng.ExecuteCommandAsync(command, timeoutSeconds);
+        }
+        catch (OperationCanceledException)
+        {
+            return $"Command '{command}' timed out after {timeoutSeconds}s. " +
+                   "The command may be waiting for something. Try kd_break to interrupt.";
+        }
+        catch (Exception ex)
+        {
+            return $"kd_execute failed: {ex.GetType().Name}: {ex.Message}";
+        }
+    }
+
+    [McpServerTool(Name = "kd_wait_for_event"), Description(
+        "Wait for a debug event (breakpoint hit, exception, etc.) with a timeout. " +
+        "Use this after kd_continue + set_breakpoint to wait for the breakpoint to be hit. " +
+        "ALWAYS returns within timeout — never hangs. If no event, target keeps running.")]
+    public static async Task<string> KdWaitForEvent(
+        StateCoordinator state,
+        DbgEngManager dbgEng,
+        [Description("How many seconds to wait for an event (default 10, max 120)")] int timeoutSeconds = 10,
+        CancellationToken ct = default)
+    {
+        var precheck = await state.ValidatePreconditionsAsync("kd_wait_for_event");
+        if (precheck != null) return precheck.ErrorMessage!;
+
+        // Clamp timeout
+        timeoutSeconds = Math.Clamp(timeoutSeconds, 1, 120);
+
+        try
+        {
+            var result = await dbgEng.WaitForEventAsync(timeoutSeconds);
+
+            // Check for BSOD if we received an event
+            if (result.Contains("halted", StringComparison.OrdinalIgnoreCase))
+            {
+                var (isBugcheck, bugcheckCode) = await dbgEng.DetectBugcheckAsync();
+                if (isBugcheck)
+                {
+                    state.SetBsodDetected(bugcheckCode);
+                    return result + $"\n\nWARNING: BSOD DETECTED (bugcheck {bugcheckCode}). " +
+                           "The OS has crashed. Use kd_execute('!analyze -v') to investigate.";
+                }
+            }
+
+            return result;
+        }
+        catch (OperationCanceledException)
+        {
+            return $"Wait cancelled after {timeoutSeconds}s. Target is still running.";
+        }
+        catch (Exception ex)
+        {
+            return $"kd_wait_for_event failed: {ex.GetType().Name}: {ex.Message}";
+        }
+    }
+}
