@@ -666,4 +666,77 @@ public class StateCoordinatorTests : IDisposable
         await _coordinator.RefreshStateAsync();
         Assert.False(_coordinator.State.GuestOpsAvailable);
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  VMware-disabled mode (Vm.VmwareEnabled = false)
+    //  Kernel debugging (KDNET) and Frida (over the network) must work
+    //  against an externally-managed VM, without ever calling vmrun.
+    // ═══════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Build a coordinator with VMware disabled and a delegate that throws if vmrun
+    /// is ever consulted — proving the disabled path never touches it.
+    /// </summary>
+    private static StateCoordinator NewVmwareDisabledCoordinator()
+    {
+        var config = new ServerConfig
+        {
+            Vm = new VmConfig { VmwareEnabled = false, GuestIpAddress = "192.0.2.11" }
+        };
+        var coordinator = new StateCoordinator(config, NullLogger<StateCoordinator>.Instance);
+        coordinator.GetVmPowerStateAsync =
+            () => throw new InvalidOperationException("vmrun must not be called when VMware is disabled");
+        coordinator.AreToolsRunningAsync =
+            _ => throw new InvalidOperationException("vmrun must not be called when VMware is disabled");
+        return coordinator;
+    }
+
+    [Fact]
+    public async Task VmwareDisabled_RefreshTreatsVmAsRunningWithoutVmrun()
+    {
+        var coordinator = NewVmwareDisabledCoordinator();
+        await coordinator.RefreshStateAsync(); // would throw if vmrun were consulted
+        Assert.Equal(VmPowerState.Running, coordinator.State.VmPower);
+        Assert.Equal(VmToolsState.Running, coordinator.State.VmTools);
+        Assert.True(coordinator.State.GuestOpsAvailable);
+    }
+
+    [Fact]
+    public async Task VmwareDisabled_KdConnectIsAllowed()
+    {
+        var coordinator = NewVmwareDisabledCoordinator();
+        Assert.Null(await coordinator.ValidatePreconditionsAsync("kd_connect"));
+    }
+
+    [Fact]
+    public async Task VmwareDisabled_FridaAttachIsAllowed()
+    {
+        var coordinator = NewVmwareDisabledCoordinator();
+        Assert.Null(await coordinator.ValidatePreconditionsAsync("umd_frida_attach"));
+    }
+
+    [Theory]
+    [InlineData("vm_start")]
+    [InlineData("vm_snapshot_restore")]
+    [InlineData("guest_run_command")]
+    [InlineData("umd_ttd")]
+    public async Task VmwareDisabled_VmrunBackedToolsAreRejected(string toolName)
+    {
+        var coordinator = NewVmwareDisabledCoordinator();
+        var result = await coordinator.ValidatePreconditionsAsync(toolName);
+        Assert.NotNull(result);
+        Assert.Contains("VMware integration", result!.Message);
+    }
+
+    [Fact]
+    public async Task VmwareDisabled_GuestOpsStillBlockedWhenKdBroken()
+    {
+        var coordinator = NewVmwareDisabledCoordinator();
+        coordinator.GetDbgEngExecutionStatus = () => DebugExecutionStatus.Break;
+        coordinator.IsDbgEngConnected = () => true;
+        coordinator.SetKdConnected(KdTransport.KDNET);
+        await coordinator.RefreshStateAsync();
+        // Frida runs in the guest; if KD has the whole machine frozen, it can't work.
+        Assert.False(coordinator.State.GuestOpsAvailable);
+    }
 }

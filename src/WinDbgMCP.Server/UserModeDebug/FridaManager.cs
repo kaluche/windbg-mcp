@@ -8,13 +8,14 @@ namespace WinDbgMCP.Server.UserModeDebug;
 /// <summary>
 /// Manages Frida instrumentation via the frida CLI tools.
 /// Uses frida-tools (Python CLI) as a subprocess for simplicity.
-/// Requires: frida-tools installed on host (pip install frida-tools),
-///           frida-server.exe running in the guest VM.
+/// Requires: frida-tools installed on the debugger host (pip install frida-tools),
+///           frida-server.exe running on the target/debuggee.
 /// </summary>
 public sealed class FridaManager : IDisposable
 {
     private const string NoIpError =
-        "Cannot determine guest VM IP address. Is the VM running with VMware Tools?";
+        "Cannot determine target host for Frida. Set Target.Host in appsettings.json " +
+        "(or legacy Vm.GuestIpAddress).";
 
     private readonly ServerConfig _config;
     private readonly VmwareManager _vmware;
@@ -41,10 +42,22 @@ public sealed class FridaManager : IDisposable
     }
 
     /// <summary>
-    /// Get the VM's IP address for Frida connection.
+    /// Get the target/debuggee address for the Frida connection.
     /// </summary>
     private async Task<string?> GetFridaHostAsync()
     {
+        // Prefer the explicit debuggee/target host. Vm.GuestIpAddress is kept as a
+        // backward-compatible fallback for older appsettings files.
+        var targetHost = !string.IsNullOrWhiteSpace(_config.Target.Host)
+            ? _config.Target.Host
+            : _config.Vm.GuestIpAddress;
+
+        if (!string.IsNullOrWhiteSpace(targetHost))
+            return $"{targetHost}:{_config.Guest.FridaPort}";
+
+        if (!_config.Vm.VmwareEnabled)
+            return null; // No static IP and no vmrun to discover one.
+
         _cachedVmIp ??= await _vmware.GetGuestIpAddressAsync();
         if (string.IsNullOrEmpty(_cachedVmIp))
             return null;
@@ -52,7 +65,7 @@ public sealed class FridaManager : IDisposable
     }
 
     /// <summary>
-    /// Attach to a process by PID in the guest VM.
+    /// Attach to a process by PID on the target/debuggee.
     /// </summary>
     public async Task<string> AttachAsync(int pid, CancellationToken ct = default)
     {
@@ -78,7 +91,7 @@ public sealed class FridaManager : IDisposable
     }
 
     /// <summary>
-    /// Attach to a process by name in the guest VM.
+    /// Attach to a process by name on the target/debuggee.
     /// </summary>
     public async Task<string> AttachByNameAsync(string processName, CancellationToken ct = default)
     {

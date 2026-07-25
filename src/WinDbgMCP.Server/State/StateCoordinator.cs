@@ -22,6 +22,17 @@ public sealed class StateCoordinator
     // BSOD detection — only check once per break-in, not every refresh
     private bool _bsodCheckedForCurrentBreak;
 
+    // Tools that fundamentally depend on vmrun (VM lifecycle + guest-OS execution).
+    // Rejected up front when VMware integration is disabled.
+    private static readonly HashSet<string> VmwareDependentTools = new(StringComparer.Ordinal)
+    {
+        "vm_start", "vm_stop", "vm_pause", "vm_resume",
+        "vm_snapshot_restore", "vm_snapshot_list", "vm_set_target", "vm_screenshot",
+        "guest_run_command", "guest_transfer_to_vm", "guest_transfer_from_vm",
+        "guest_list_processes", "guest_kill_process",
+        "umd_ttd",
+    };
+
     // Public read-only accessor for state
     public SystemState State => _state;
 
@@ -62,6 +73,14 @@ public sealed class StateCoordinator
         {
             await RefreshStateAsync();
 
+            // When VMware integration is disabled, vmrun-backed tools cannot work.
+            // Reject them with an actionable message instead of letting them fail later.
+            if (!_config.Vm.VmwareEnabled && VmwareDependentTools.Contains(toolName))
+                return ToolResult.Error(
+                    $"'{toolName}' requires the VMware integration, which is disabled " +
+                    "(Vm.VmwareEnabled=false). This server is configured for kernel debugging " +
+                    "(kd_* over KDNET). Use direct operator-host Frida, not MCP Frida, in this deployment.");
+
             return toolName switch
             {
                 // --- VM tools ---
@@ -81,7 +100,16 @@ public sealed class StateCoordinator
                 "kd_continue" => RequireKdConnected_TargetBroken_CanResume(),
                 "kd_step" => RequireKdConnected_TargetBroken_NoWaitPending(),
                 "kd_execute" => RequireKdConnected_TargetBroken(),
-                "kd_wait_for_event" => RequireKdConnected(),
+            "kd_symbol_status" => RequireKdConnected_TargetBroken(),
+            "kd_find_process_by_name" => RequireKdConnected_TargetBroken(),
+            "kd_find_process_by_name_raw" => RequireKdConnected_TargetBroken(),
+            "kd_list_threads" => RequireKdConnected_TargetBroken(),
+            "kd_list_threads_raw" => RequireKdConnected_TargetBroken(),
+            "kd_switch_process" => RequireKdConnected_TargetBroken(),
+            "kd_switch_thread" => RequireKdConnected_TargetBroken(),
+            "kd_stack" => RequireKdConnected_TargetBroken(),
+            "kd_stack_process_thread" => RequireKdConnected_TargetBroken(),
+            "kd_wait_for_event" => RequireKdConnected(),
 
                 // --- Guest tools ---
                 "guest_run_command" => RequireGuestOpsAvailable(),
@@ -92,7 +120,7 @@ public sealed class StateCoordinator
 
                 // --- User-mode debug tools ---
                 "umd_frida_attach" => RequireGuestOpsAvailable(),
-                "umd_frida" => RequireGuestOpsAvailable(),
+                "umd_frida" => RequireFridaAttached(),
                 "umd_dbgsrv_connect" => RequireGuestOpsAvailable(),
                 "umd_dbgsrv_execute" => RequireDbgsrvConnected(),
                 "umd_ttd" => RequireGuestOpsAvailable(),
@@ -180,48 +208,60 @@ public sealed class StateCoordinator
             _state.DbgsrvState = null;
         }
 
-        // 3. VM power state — only refresh if stale (>2 seconds old)
-        // Skip refresh if state is Paused — vmrun list can't distinguish paused
-        // from running, so we'd overwrite the manually-tracked Paused state.
-        if (_state.VmPower != VmPowerState.Paused &&
-            DateTime.UtcNow - _lastVmStateRefresh > TimeSpan.FromSeconds(2))
+        // 3. VM power / tools status.
+        if (!_config.Vm.VmwareEnabled)
         {
-            if (GetVmPowerStateAsync != null)
-            {
-                try
-                {
-                    _state.VmPower = await GetVmPowerStateAsync();
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to refresh VM power state");
-                    // Keep last known state
-                }
-            }
-            _lastVmStateRefresh = DateTime.UtcNow;
+            // No vmrun backend: the VM is managed externally and assumed reachable.
+            // Treat it as Running with Tools up so the kernel-debug and Frida gates can
+            // open. The KD-frozen check in RequireGuestOpsAvailable still applies.
+            _state.VmPower = VmPowerState.Running;
+            _state.VmTools = VmToolsState.Running;
         }
-
-        // 4. Tools status — only if VM is running and not kernel-broken
-        if (_state.VmPower == VmPowerState.Running &&
-            _state.KdExecStatus != DebugExecutionStatus.Break &&
-            DateTime.UtcNow - _lastToolsRefresh > TimeSpan.FromSeconds(5))
+        else
         {
-            if (AreToolsRunningAsync != null)
+            // VM power state — only refresh if stale (>2 seconds old)
+            // Skip refresh if state is Paused — vmrun list can't distinguish paused
+            // from running, so we'd overwrite the manually-tracked Paused state.
+            if (_state.VmPower != VmPowerState.Paused &&
+                DateTime.UtcNow - _lastVmStateRefresh > TimeSpan.FromSeconds(2))
             {
-                try
+                if (GetVmPowerStateAsync != null)
                 {
-                    var toolsTimeout = TimeSpan.FromSeconds(_config.Timeouts.VmToolsCheckSeconds);
-                    _state.VmTools = await AreToolsRunningAsync(toolsTimeout)
-                        ? VmToolsState.Running
-                        : VmToolsState.NotResponding;
+                    try
+                    {
+                        _state.VmPower = await GetVmPowerStateAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to refresh VM power state");
+                        // Keep last known state
+                    }
                 }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to check VMware Tools status");
-                    _state.VmTools = VmToolsState.NotResponding;
-                }
+                _lastVmStateRefresh = DateTime.UtcNow;
             }
-            _lastToolsRefresh = DateTime.UtcNow;
+
+            // Tools status — only if VM is running and not kernel-broken
+            if (_state.VmPower == VmPowerState.Running &&
+                _state.KdExecStatus != DebugExecutionStatus.Break &&
+                DateTime.UtcNow - _lastToolsRefresh > TimeSpan.FromSeconds(5))
+            {
+                if (AreToolsRunningAsync != null)
+                {
+                    try
+                    {
+                        var toolsTimeout = TimeSpan.FromSeconds(_config.Timeouts.VmToolsCheckSeconds);
+                        _state.VmTools = await AreToolsRunningAsync(toolsTimeout)
+                            ? VmToolsState.Running
+                            : VmToolsState.NotResponding;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to check VMware Tools status");
+                        _state.VmTools = VmToolsState.NotResponding;
+                    }
+                }
+                _lastToolsRefresh = DateTime.UtcNow;
+            }
         }
 
         // 5. Derive compound states

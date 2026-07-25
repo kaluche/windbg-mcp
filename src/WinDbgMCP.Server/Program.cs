@@ -13,37 +13,33 @@ using WinDbgMCP.Server.Vmware;
 
 var builder = Host.CreateApplicationBuilder(args);
 
-// Load configuration relative to the executable, not CWD
-var exeDir = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location)!;
-builder.Configuration.AddJsonFile(Path.Combine(exeDir, "appsettings.json"), optional: false, reloadOnChange: true);
+// Load optional configuration relative to the executable, not the caller's CWD.
+// A published single-file EXE can run without a sidecar appsettings.json when
+// values are provided through command-line args or WINDBG_MCP_* environment variables.
+var exeDir = AppContext.BaseDirectory;
+builder.Configuration
+    .AddJsonFile(Path.Combine(exeDir, "appsettings.json"), optional: true, reloadOnChange: true)
+    .AddEnvironmentVariables(prefix: "WINDBG_MCP_")
+    .AddCommandLine(args);
 
-// MCP servers use stdio — route all logs to stderr
+// MCP servers use stdio. Keep logs on stderr so stdout remains JSON-RPC only.
 builder.Logging.AddConsole(options =>
 {
     options.LogToStandardErrorThreshold = LogLevel.Trace;
 });
 
-// Bind configuration
 var config = new ServerConfig();
 builder.Configuration.Bind(config);
+ApplyPortableOverrides(config);
 
-// Register services as singletons (single MCP server process, single VM)
 builder.Services.AddSingleton(config);
 builder.Services.AddSingleton<VmwareManager>();
-
-// DbgEng thread + manager — kernel debugging layer
-builder.Services.AddSingleton<DbgEngThread>(sp =>
-    new DbgEngThread(sp.GetRequiredService<ILogger<DbgEngThread>>()));
+builder.Services.AddSingleton<DbgEngThread>(sp => new DbgEngThread(sp.GetRequiredService<ILogger<DbgEngThread>>()));
 builder.Services.AddSingleton<DbgEngManager>();
-
-// Guest execution manager
 builder.Services.AddSingleton<GuestExecManager>();
-
-// User-mode debug managers
 builder.Services.AddSingleton<FridaManager>();
 builder.Services.AddSingleton<DbgsrvManager>();
 builder.Services.AddSingleton<TtdManager>();
-
 builder.Services.AddSingleton<StateCoordinator>(sp =>
 {
     var stateConfig = sp.GetRequiredService<ServerConfig>();
@@ -53,55 +49,52 @@ builder.Services.AddSingleton<StateCoordinator>(sp =>
     var frida = sp.GetRequiredService<FridaManager>();
     var dbgsrv = sp.GetRequiredService<DbgsrvManager>();
 
-    var coordinator = new StateCoordinator(stateConfig, logger);
-
-    // Wire up state refresh delegates to the VmwareManager
-    coordinator.GetVmPowerStateAsync = () => vmware.GetPowerStateAsync();
-    coordinator.AreToolsRunningAsync = (timeout) => vmware.AreToolsRunningAsync(timeout);
-
-    // Wire up KD state delegates to DbgEngManager
-    coordinator.IsDbgEngConnected = () => dbgEng.IsConnected;
-    coordinator.GetDbgEngExecutionStatus = () => dbgEng.GetExecutionStatus();
-    coordinator.GetPendingEventCount = () => dbgEng.PendingEventCount;
-
-    // Wire up UMD state delegates
-    coordinator.IsFridaAttached = () => frida.IsAttached;
-    coordinator.GetFridaTargetName = () => frida.AttachedProcessName;
-    coordinator.IsDbgsrvConnected = () => dbgsrv.IsConnected;
-    coordinator.GetDbgsrvAttachedPid = () => dbgsrv.AttachedPid;
-
-    // Cleanup delegates for snapshot restore
-    coordinator.CleanupKdSession = () => dbgEng.ResetConnectionState();
-    coordinator.CleanupFridaSession = () => frida.Dispose();
-    coordinator.CleanupDbgsrvSession = () => dbgsrv.Dispose();
+    var coordinator = new StateCoordinator(stateConfig, logger)
+    {
+        GetVmPowerStateAsync = () => vmware.GetPowerStateAsync(),
+        AreToolsRunningAsync = timeout => vmware.AreToolsRunningAsync(timeout),
+        IsDbgEngConnected = () => dbgEng.IsConnected,
+        GetDbgEngExecutionStatus = () => dbgEng.GetExecutionStatus(),
+        GetPendingEventCount = () => dbgEng.PendingEventCount,
+        IsFridaAttached = () => frida.IsAttached,
+        GetFridaTargetName = () => frida.AttachedProcessName,
+        IsDbgsrvConnected = () => dbgsrv.IsConnected,
+        GetDbgsrvAttachedPid = () => dbgsrv.AttachedPid,
+        CleanupKdSession = () => dbgEng.ResetConnectionState(),
+        CleanupFridaSession = () => frida.Dispose(),
+        CleanupDbgsrvSession = () => dbgsrv.Dispose(),
+    };
 
     return coordinator;
 });
 
-// Build tool type list — conditionally exclude tools that don't work with encrypted VMs
-var isEncrypted = !string.IsNullOrEmpty(config.Vm.VmPassword);
 var toolTypes = new List<Type>
 {
-    typeof(VmTools),
     typeof(KernelDebugTools),
-    typeof(GuestTools),
-    typeof(UserModeDebugTools),
     typeof(MetaTools),
 };
-if (!isEncrypted)
+
+var serverSideUserModeToolsEnabled = config.UserModeDebug.ServerSideToolsEnabled || config.Vm.VmwareEnabled;
+if (serverSideUserModeToolsEnabled)
 {
-    toolTypes.Add(typeof(VmScreenshotTool));
+    toolTypes.Add(typeof(UserModeDebugTools));
 }
 
-// Register MCP server with conditionally selected tools
+if (config.Vm.VmwareEnabled)
+{
+    toolTypes.Insert(0, typeof(VmTools));
+    toolTypes.Add(typeof(GuestTools));
+
+    if (string.IsNullOrEmpty(config.Vm.VmPassword))
+    {
+        toolTypes.Add(typeof(VmScreenshotTool));
+    }
+}
+
 builder.Services
     .AddMcpServer(options =>
     {
-        options.ServerInfo = new()
-        {
-            Name = "WinDbgMCP",
-            Version = "1.0.0-alpha"
-        };
+        options.ServerInfo = new() { Name = "WinDbgMCP", Version = "1.0.0-alpha" };
         options.ServerInstructions = BuildServerInstructions(config);
     })
     .WithStdioServerTransport()
@@ -109,134 +102,96 @@ builder.Services
 
 await builder.Build().RunAsync();
 
-static string BuildServerInstructions(ServerConfig config)
+static void ApplyPortableOverrides(ServerConfig config)
 {
-    var sb = new System.Text.StringBuilder();
+    ApplyString("WINDBG_MCP_TARGET_HOST", value => config.Target.Host = value);
+    ApplyString("WINDBG_MCP_KDNET_KEY", value => config.KernelDebug.Kdnet.Key = value);
+    ApplyString("WINDBG_MCP_SYMBOL_PATH", value => config.KernelDebug.SymbolPath = value);
+    ApplyString("WINDBG_MCP_TRANSCRIPT_DIRECTORY", value => config.KernelDebug.TranscriptDirectory = value);
+    ApplyInt("WINDBG_MCP_KDNET_PORT", value => config.KernelDebug.Kdnet.Port = value);
+    ApplyInt("WINDBG_MCP_FRIDA_PORT", value => config.Guest.FridaPort = value);
+    ApplyBool("WINDBG_MCP_VMWARE_ENABLED", value => config.Vm.VmwareEnabled = value);
+    ApplyBool("WINDBG_MCP_SERVER_SIDE_UMD", value => config.UserModeDebug.ServerSideToolsEnabled = value);
 
-    sb.AppendLine("# WinDbgMCP — Windows VM Control & Kernel Debugging Server");
-    sb.AppendLine();
-    sb.AppendLine("You have full control over a Windows VM: lifecycle, kernel debugging, guest execution, and user-mode debugging.");
-    sb.AppendLine();
-
-    // === Credentials ===
-    sb.AppendLine("## VM Credentials (from config)");
-    sb.AppendLine($"- Guest username: {config.Vm.GuestUsername}");
-    sb.AppendLine($"- Guest password: {config.Vm.GuestPassword}");
-    if (!string.IsNullOrEmpty(config.Vm.VmPassword))
-        sb.AppendLine($"- VM encryption password: {config.Vm.VmPassword}");
-    sb.AppendLine($"- KDNET port: {config.KernelDebug.Kdnet.Port}");
-    sb.AppendLine($"- KDNET key: {config.KernelDebug.Kdnet.Key}");
-    sb.AppendLine($"- Frida port: {config.Guest.FridaPort}");
-    sb.AppendLine($"- dbgsrv port: {config.Guest.DbgsrvPort}");
-    sb.AppendLine();
-
-    // === Default snapshot ===
-    if (!string.IsNullOrEmpty(config.Security.DefaultSnapshotName))
+    static void ApplyString(string name, Action<string> apply)
     {
-        sb.AppendLine("## Default Snapshot");
-        sb.AppendLine($"- Name: \"{config.Security.DefaultSnapshotName}\"");
-        sb.AppendLine("- This is the known-good recovery snapshot. Use vm_snapshot_restore with this name to revert to a clean, well-configured state (debug boot enabled, tools installed, logged in).");
-        sb.AppendLine();
+        var value = Environment.GetEnvironmentVariable(name);
+        if (!string.IsNullOrWhiteSpace(value))
+            apply(value);
     }
 
-    // === Guest tool paths ===
-    sb.AppendLine("## Guest VM Tool Paths");
-    sb.AppendLine("These tools are pre-installed in the guest VM at known paths:");
-    sb.AppendLine("- **frida-server**: `C:\\Tools\\frida-server.exe` — should already be running (port 27042)");
-    sb.AppendLine("- **dbgsrv**: `C:\\Tools\\DbgSrv\\dbgsrv.exe` — start manually when needed (port 5064)");
-    sb.AppendLine("  - Dependencies in same dir: `dbgeng.dll`, `dbghelp.dll` (all 3 files required)");
-    sb.AppendLine("- **TTD**: `C:\\Tools\\TTD\\TTD.exe` — for Time Travel Debugging recordings");
-    sb.AppendLine();
-    sb.AppendLine("To start dbgsrv: `guest_run_command(\"start /b C:\\Tools\\DbgSrv\\dbgsrv.exe -t tcp:port=5064\")`");
-    sb.AppendLine("To verify frida-server: `guest_run_command(\"tasklist /FI \\\"IMAGENAME eq frida-server.exe\\\"\")`");
+    static void ApplyInt(string name, Action<int> apply)
+    {
+        var value = Environment.GetEnvironmentVariable(name);
+        if (int.TryParse(value, out var parsed))
+            apply(parsed);
+    }
+
+    static void ApplyBool(string name, Action<bool> apply)
+    {
+        var value = Environment.GetEnvironmentVariable(name);
+        if (bool.TryParse(value, out var parsed))
+            apply(parsed);
+    }
+}
+
+static string BuildServerInstructions(ServerConfig config)
+{
+    var serverSideUserModeToolsEnabled = config.UserModeDebug.ServerSideToolsEnabled || config.Vm.VmwareEnabled;
+    var targetHost = !string.IsNullOrWhiteSpace(config.Target.Host)
+        ? config.Target.Host
+        : config.Vm.GuestIpAddress;
+    var targetLabel = string.IsNullOrWhiteSpace(targetHost) ? "<TARGET_IP>" : targetHost;
+
+    var sb = new System.Text.StringBuilder();
+    sb.AppendLine("# WinDbgMCP");
     sb.AppendLine();
 
-    // === Tool catalog ===
-    var vmIsEncrypted = !string.IsNullOrEmpty(config.Vm.VmPassword);
-    var totalTools = vmIsEncrypted ? 27 : 28;
-    sb.AppendLine($"## Tools ({totalTools} total)");
+    if (!config.Vm.VmwareEnabled)
+    {
+        sb.AppendLine("This server is running without VMware/vmrun integration.");
+        sb.AppendLine("Use it for kernel debugging over KDNET.");
+        sb.AppendLine("Do not attempt VM lifecycle, guest command, file transfer, screenshot, snapshot, Frida, dbgsrv, or TTD workflows through this MCP server in this deployment.");
+    }
+    else
+    {
+        sb.AppendLine("This server controls a VMware-backed Windows target plus kernel and user-mode debugging tools.");
+    }
+
     sb.AppendLine();
-    sb.AppendLine("### Meta");
-    sb.AppendLine("- `get_system_state` — Full state overview (VM, KD, guest ops, UMD). ALWAYS allowed. Call when unsure.");
+    sb.AppendLine("## Topology");
+    sb.AppendLine("- MCP clients connect to mcp-proxy on the Windows debugger host.");
+    sb.AppendLine("- The .NET server runs on the debugger host and uses DbgEng locally.");
+    sb.AppendLine($"- KDNET listens on UDP port {config.KernelDebug.Kdnet.Port} on the debugger host; the target is configured to connect to that host.");
+    sb.AppendLine($"- Frida is not MCP. In this lab, access frida-server directly from the operator/LLM host at {targetLabel}:{config.Guest.FridaPort}; the debugger host does not need Frida CLI tools.");
     sb.AppendLine();
 
-    var vmToolCount = vmIsEncrypted ? 6 : 7;
-    sb.AppendLine($"### VM Tools ({vmToolCount})");
-    sb.AppendLine("- `vm_start` — Power on. Wait for VMware Tools before guest ops.");
-    sb.AppendLine("- `vm_stop` — Shut down (hard=true for force power off).");
-    sb.AppendLine("- `vm_pause` — Freeze entire VM (NOT the same as kd_break).");
-    sb.AppendLine("- `vm_resume` — Unpause a paused VM.");
-    sb.AppendLine("- `vm_snapshot_restore` — Restore checkpoint. DESTROYS all debug sessions.");
-    sb.AppendLine("- `vm_snapshot_list` — List available snapshots.");
-    if (!vmIsEncrypted)
-        sb.AppendLine("- `vm_screenshot` — Capture VM display (boot screen, BSOD, desktop).");
-    sb.AppendLine();
+    sb.AppendLine("## Safe starting point");
+    sb.AppendLine("- Call `get_system_state` first.");
+    sb.AppendLine("- For kernel inspection, use `kd_connect`, `kd_break` if needed, `kd_execute` for inspection commands, `kd_continue`, `kd_wait_for_event`, and `kd_disconnect`.");
+    sb.AppendLine("- Do not send execution-control commands such as `g`, `p`, `t`, `q`, `.detach`, `.reboot`, or `.restart` through `kd_execute`; use the dedicated MCP tools.");
+    if (serverSideUserModeToolsEnabled)
+    {
+        sb.AppendLine("- Server-side user-mode tools are enabled; use `umd_frida_attach`/`umd_frida` only if the debugger host has Frida CLI tools and can reach the target.");
+    }
+    else
+    {
+        sb.AppendLine("- Server-side user-mode MCP tools are not registered. Use direct Frida commands from the operator/LLM host instead.");
+    }
 
-    sb.AppendLine("### Kernel Debug Tools (7) — requires `kd_connect` first");
-    sb.AppendLine("- `kd_connect` — Attach to kernel via KDNET. VM must have debug boot enabled. Target breaks on connect.");
-    sb.AppendLine("- `kd_disconnect` — Detach. Resumes target so VM keeps running.");
-    sb.AppendLine("- `kd_break` — Halt running target (Ctrl+Break). After breaking, use kd_execute.");
-    sb.AppendLine("- `kd_continue` — Resume target (go). Returns immediately. Guest ops require target running.");
-    sb.AppendLine("- `kd_step` — Step one instruction (mode='into' or 'over').");
-    sb.AppendLine("- `kd_execute` — Run any WinDbg command: k, r, lm, !process 0 0, !analyze -v, db, u, x, .reload, bp, etc.");
-    sb.AppendLine("- `kd_wait_for_event` — Wait for breakpoint/exception (with timeout). Always returns.");
-    sb.AppendLine();
+    if (config.Vm.VmwareEnabled)
+    {
+        sb.AppendLine();
+        sb.AppendLine("## VMware-backed tools");
+        sb.AppendLine("- `vm_*` tools control VMware lifecycle and snapshots.");
+        sb.AppendLine("- `guest_*` tools run commands and transfer files through VMware guest operations.");
+        sb.AppendLine("- Snapshot restore destroys active KD, Frida, and dbgsrv sessions; reconnect after restore.");
+    }
 
-    sb.AppendLine("### Guest Tools (5) — requires VM running + VMware Tools + target NOT frozen");
-    sb.AppendLine("- `guest_run_command` — Execute command in guest (cmd.exe /c). Captures stdout/stderr.");
-    sb.AppendLine("- `guest_transfer_to_vm` — Copy file host -> guest (deploy drivers, tools).");
-    sb.AppendLine("- `guest_transfer_from_vm` — Copy file guest -> host (retrieve dumps, logs).");
-    sb.AppendLine("- `guest_list_processes` — List running processes with PIDs.");
-    sb.AppendLine("- `guest_kill_process` — Kill process by PID.");
     sb.AppendLine();
-
-    sb.AppendLine("### User-Mode Debug Tools (8)");
-    sb.AppendLine("- `umd_frida_attach` — Attach Frida to guest process (requires frida-server in guest).");
-    sb.AppendLine("- `umd_frida` — Frida operations: inject JS, eval, list processes, detach.");
-    sb.AppendLine("- `umd_frida_skill` — Get Frida best practices, API reference, and usage patterns. Call before using Frida.");
-    sb.AppendLine("- `umd_dbgsrv_connect` — Connect to dbgsrv.exe in guest for user-mode debugging.");
-    sb.AppendLine("- `umd_dbgsrv_execute` — Attach to PID, run WinDbg commands, detach, disconnect.");
-    sb.AppendLine("- `umd_dbgsrv_skill` — Get dbgsrv best practices, WinDbg command reference. Call before using dbgsrv.");
-    sb.AppendLine("- `umd_ttd` — Time Travel Debugging: record_launch, record_attach, stop, retrieve, list.");
-    sb.AppendLine("- `umd_ttd_query` — Query TTD traces (not yet implemented — use WinDbg Preview).");
-    sb.AppendLine();
-
-    // === Critical rules ===
-    sb.AppendLine("## Critical Rules");
-    sb.AppendLine();
-    sb.AppendLine("1. **BREAK vs RUNNING**: Kernel debug commands (kd_execute, kd_step) require the target to be at a BREAK. Guest operations (guest_run_command, guest_transfer_*) require the target to be RUNNING. If the kernel debugger froze the VM, call `kd_continue` before guest ops.");
-    sb.AppendLine();
-    sb.AppendLine("2. **Blocked commands in kd_execute**: `g`, `gh`, `gn`, `gu`, `p`, `t`, `pa`, `ta`, `wt`, `tt`, `pc`, `tc` are BLOCKED because they change execution state. Use `kd_continue` (go) or `kd_step` (step) instead.");
-    sb.AppendLine();
-    sb.AppendLine("3. **kd_wait_for_event is safe**: It ALWAYS returns within the timeout. Use it after kd_continue + breakpoint to wait for the breakpoint to trigger.");
-    sb.AppendLine();
-    sb.AppendLine("4. **After BSOD**: get_system_state will show IsBugcheck=True. You can still debug — use kd_execute('!analyze -v'), kd_execute('k'), kd_execute('r'), etc. to investigate the crash. Guest operations won't work while at the BSOD. To recover: (a) kd_continue — the VM will reboot on its own, wait for it to come back up and guest ops work again, OR (b) vm_snapshot_restore to revert to a clean state. Choose whichever fits your goal.");
-    sb.AppendLine();
-    sb.AppendLine("5. **Snapshot restore resets everything**: All debug sessions (KD, Frida, dbgsrv) are destroyed. Reconnect after restoring.");
-    sb.AppendLine();
-    sb.AppendLine("6. **get_system_state first**: When unsure about the current state, call get_system_state. It's always allowed and tells you exactly what's available.");
-    sb.AppendLine();
-
-    // === Common workflows ===
-    sb.AppendLine("## Common Workflows");
-    sb.AppendLine();
-    sb.AppendLine("**Inspect a running kernel:**");
-    sb.AppendLine("kd_connect -> kd_execute('lm') -> kd_execute('!process 0 0') -> kd_disconnect");
-    sb.AppendLine();
-    sb.AppendLine("**Set breakpoint and wait:**");
-    sb.AppendLine("kd_connect -> kd_execute('bp nt!NtCreateFile') -> kd_continue -> kd_wait_for_event(30) -> kd_execute('k') -> kd_disconnect");
-    sb.AppendLine();
-    sb.AppendLine("**Deploy and debug a driver:**");
-    sb.AppendLine("guest_transfer_to_vm(driver.sys, C:\\Windows\\System32\\drivers\\driver.sys) -> guest_run_command('sc create MyDrv type= kernel binPath= ...') -> guest_run_command('sc start MyDrv') -> kd_connect -> kd_execute('lm m MyDrv') -> kd_disconnect");
-    sb.AppendLine();
-    sb.AppendLine("**Execute command in guest:**");
-    sb.AppendLine("guest_run_command('ipconfig /all') — runs in guest, returns stdout/stderr");
-    sb.AppendLine();
-    sb.AppendLine("**Crash analysis:**");
-    sb.AppendLine("kd_connect -> kd_execute('!analyze -v') -> kd_execute('k') -> kd_execute('r') -> kd_disconnect");
-    sb.AppendLine();
-    sb.AppendLine("**Record with TTD:**");
-    sb.AppendLine("umd_ttd(action='record_launch', target='C:\\path\\to\\app.exe') -> [use the app] -> umd_ttd(action='stop') -> umd_ttd(action='retrieve', target='trace.run', outputPath='C:\\host\\trace.run')");
+    sb.AppendLine("## Crash handling");
+    sb.AppendLine("- If `get_system_state` reports a bugcheck, inspect with `kd_execute(\"!analyze -v\")`, `kd_execute(\"k\")`, and `kd_execute(\"r\")`.");
+    sb.AppendLine("- `kd_disconnect` detaches and resumes the target. Remove temporary breakpoints before disconnecting when practical.");
 
     return sb.ToString();
 }

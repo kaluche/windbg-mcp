@@ -51,6 +51,15 @@ public sealed class DbgEngManager : IDisposable
 
         return await _thread.ExecuteAsync(() =>
         {
+            // Tear down any client left over from a prior failed/aborted connect so we
+            // don't leak it (and its bound KDNET UDP port) when creating a new one —
+            // a leaked client keeps the port bound and makes retries fail with E_FAIL.
+            if (_client != null)
+            {
+                try { _client.TryEndSession(DEBUG_END.ACTIVE_TERMINATE); } catch { }
+                _client = null;
+            }
+
             _logger.LogInformation("Creating DbgEng client...");
 
             // Find Windows SDK debugger directory for dbgeng.dll
@@ -124,8 +133,13 @@ public sealed class DbgEngManager : IDisposable
             // Attach to kernel
             var attachHr = _client.TryAttachKernel(DEBUG_ATTACH.KERNEL_CONNECTION, connStr);
             if (attachHr != HRESULT.S_OK)
+            {
+                // Clean up the failed client so it doesn't leak the KDNET UDP socket.
+                try { _client.TryEndSession(DEBUG_END.ACTIVE_TERMINATE); } catch { }
+                _client = null;
                 throw new InvalidOperationException(
                     $"AttachKernel failed: {attachHr}. " + ErrorMessages.KdConnectFailed);
+            }
 
             _logger.LogInformation("AttachKernel succeeded, waiting for initial breakpoint...");
 

@@ -31,11 +31,18 @@ src/WinDbgMCP.Server/appsettings.json
 # MCP client config (contains local paths)
 .mcp.json
 
-# Debug logs
+# Debug logs and transcripts
 *.log
+*.jsonl
+transcripts/
+**/transcripts/
 
-# Python utility scripts (dev-only, not part of the project)
-*.py
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
 
 # Frida temp scripts
 frida_script_*.js
+
+# Local publish output
+src/WinDbgMCP.Server/win-x64/

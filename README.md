@@ -1,73 +1,101 @@
-# WinDbg MCP Server
+# WinDbgMCP
 
-A [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server that gives AI agents complete control over a Windows VM for kernel debugging, reverse engineering, malware analysis, and vulnerability research.
+## Fork Changes
 
-Built in C# (.NET 8), it wraps the Windows Debugger Engine (DbgEng COM), VMware Workstation, Frida, and dbgsrv into **29 MCP tools** that any MCP-compatible LLM client can call.
+This fork targets a no-VMware KDNET deployment: Codex/Claude connect to `mcp-proxy` on a Windows debugger host, and Frida is used directly from the operator host.
+It adds externally managed targets, VMware-disabled mode, safer tool registration, KD process/thread helpers, transcript support, helper scripts, and cleaner install docs.
 
-![Architecture](https://img.shields.io/badge/.NET_8-512BD4?logo=dotnet&logoColor=white)
-![Platform](https://img.shields.io/badge/Windows-0078D6?logo=windows&logoColor=white)
-![VMware](https://img.shields.io/badge/VMware_Workstation-607078?logo=vmware&logoColor=white)
-![License](https://img.shields.io/badge/license-MIT-green)
+WinDbgMCP is a Windows-hosted MCP server for WinDbg/DbgEng KDNET debugging.
 
-## Why this project?
+Current deployment topology:
 
-Other WinDbg MCP servers exist — most are Python wrappers that launch `cdb.exe` or `windbg.exe` as a subprocess and drive it over stdin/stdout. That's easy to prototype but fragile in practice: the child debugger crashes, hangs on modal dialogs, deadlocks its own pipes, or dies mid-session and takes the agent's context with it.
+```text
+MCP / KDNET:
+  Codex or Claude -> Windows debugger host -> mcp-proxy -> WinDbgMCP.Server -> KDNET target
 
-This project takes a different approach:
-
-- **Direct DbgEng COM** — calls the Windows Debugger Engine natively through its COM interface. No subprocess to babysit, no stdout parsing, no hung pipes. Commands execute inside the server process on a dedicated MTA COM thread with an event pump — so the debugger can't drag the whole MCP server down with it.
-- **Kernel debugging is the primary use case, not an afterthought** — full KDNET integration: attach to a running kernel, set breakpoints, step, run any WinDbg command while the target is halted, wait for events with hard timeouts, detect BSODs, and pass first-chance exceptions through so Windows keeps running normally. Execution-control commands (`g`/`t`/`p`) are blocked in `kd_execute` so the LLM can't accidentally run away from a breakpoint — it has to use the explicit `kd_continue`/`kd_step` tools, which always return.
-- **User-mode is covered too** — Frida (with eternalized hooks for persistent instrumentation across sessions), dbgsrv for noninvasive process inspection with full WinDbg command access, and TTD (Time Travel Debugging) — all behind the same server.
-- **VM lifecycle is integrated with the debug session** — snapshot restore cleanly tears down KD/Frida/dbgsrv before reverting the VM; guest commands, file transfer, and process control are all gated on VM power state so the agent never trips on "wrong state" errors. `vm_set_target` lets a running server switch to a different VM at runtime.
-- **Designed for LLM agents** — every tool has a hard timeout (nothing blocks forever), every error message explicitly tells the LLM what to do next, and `get_system_state` gives the model a single "where am I?" snapshot on demand. A `StateCoordinator` validates preconditions before every call so the agent gets useful feedback instead of silent failures.
-
-## What Can It Do?
-
-An LLM connected to this server can autonomously:
-
-- **Control a VM** — start, stop, pause, resume, snapshot, restore, screenshot
-- **Kernel debug** — connect via KDNET, set breakpoints, step, execute any WinDbg command, wait for events
-- **Run commands in the guest** — execute programs, transfer files, list/kill processes
-- **User-mode debug** — attach Frida to hook functions, inspect processes via dbgsrv, record TTD traces
-
-All without the LLM ever needing direct access to WinDbg, a terminal, or the VM itself.
-
-## Quick Start
-
-### Prerequisites
-
-| Requirement | Purpose |
-|---|---|
-| [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0) | Build & run the server |
-| [VMware Workstation Pro](https://www.vmware.com/products/workstation-pro.html) | VM management (vmrun) |
-| Windows Guest VM | Target for debugging |
-| KDNET enabled in guest | Kernel debugging (see [Setup](#vm-setup)) |
-| [frida-tools](https://frida.re/) *(optional)* | User-mode instrumentation |
-| [WinDbg Preview](https://aka.ms/windbg) *(optional)* | Provides dbgsrv.exe for remote user-mode debugging |
-
-### 1. Clone & Build
-
-```bash
-git clone https://github.com/memoryforensics1/windbg-mcp.git
-cd windbg-mcp
-dotnet build src/WinDbgMCP.Server/WinDbgMCP.Server.csproj
+Frida:
+  Codex or Claude/operator host -> frida-server on target/debuggee
 ```
 
-### 2. Configure *(optional)*
+The Windows debugger host does not need Frida tools for this setup. Frida is not an MCP endpoint here; connect to `frida-server` directly from the operator/LLM host.
 
-<details>
-<summary>Everything in <code>appsettings.json</code> is just a default — the LLM can change VM target, credentials, KDNET key, and more at runtime via <code>vm_set_target</code>. Expand only if you want to set a starting config.</summary>
+The current no-VMware deployment also does not use `vmrun`, snapshots, guest file transfer, screenshots, or VMware guest operations.
 
-Copy `src/WinDbgMCP.Server/appsettings.example.json` to `appsettings.json` and edit:
+## Run On The Windows Debugger Host
+
+See [INSTALL.md](INSTALL.md) for debugger-host and debuggee KDNET configuration.
+
+Build or publish the server on the Windows debugger host, then run it behind `mcp-proxy`.
+
+Debug build example:
+
+```powershell
+cd C:\tmp\windbg\windbg-mcp
+dotnet build src\WinDbgMCP.Server\WinDbgMCP.Server.csproj
+mcp-proxy --host 0.0.0.0 --port 8002 -- C:\tmp\windbg\windbg-mcp\src\WinDbgMCP.Server\bin\Debug\net8.0-windows\win-x64\WinDbgMCP.Server.exe
+```
+
+Published/single-directory example:
+
+```powershell
+mcp-proxy --host 0.0.0.0 --port 8002 -- C:\tmp\windbg\win-x64\WinDbgMCP.Server.exe
+```
+
+For file-based configuration, place `appsettings.json` next to `WinDbgMCP.Server.exe`. A single-file EXE can also run without that sidecar when configured with environment variables. If `mcp-proxy` reports `MCP error -32000: Connection closed`, run the EXE directly in PowerShell first; that usually exposes missing configuration, missing .NET runtime, bad config, or missing Windows debugging components.
+
+### Standalone EXE
+
+Publish a self-contained single-file Windows executable:
+
+```powershell
+dotnet publish src\WinDbgMCP.Server\WinDbgMCP.Server.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o .\publish\win-x64
+```
+
+`WinDbgMCP.Server.exe` can run without an adjacent `appsettings.json` when configured with environment variables:
+
+```powershell
+$env:WINDBG_MCP_VMWARE_ENABLED="false"
+$env:WINDBG_MCP_TARGET_HOST="<TARGET_IP>"
+$env:WINDBG_MCP_KDNET_PORT="50000"
+$env:WINDBG_MCP_KDNET_KEY="your.kdnet.key.here"
+mcp-proxy --host 0.0.0.0 --port 8002 -- .\publish\win-x64\WinDbgMCP.Server.exe
+```
+
+Windows debugging components/DbgEng still need to be installed on the debugger host.
+
+## Add The MCP Server
+
+Claude uses the SSE endpoint:
+
+```bash
+claude mcp add --scope project --transport sse windbg-mcp http://<DEBUGGER_HOST>:8002/sse
+```
+
+Codex uses the streamable HTTP endpoint:
+
+```bash
+codex mcp add windbg-mcp --url http://<DEBUGGER_HOST>:8002/mcp
+```
+
+Replace `<DEBUGGER_HOST>` with the Windows debugger host IP or DNS name.
+
+## Server Configuration
+
+The server optionally reads `appsettings.json` from the server executable directory. Environment variables and command-line configuration can be used instead for standalone EXE deployments.
+
+Recommended no-VMware/no-server-side-Frida shape:
 
 ```json
 {
+  "Target": {
+    "Host": "<TARGET_IP>"
+  },
+  "UserModeDebug": {
+    "ServerSideToolsEnabled": false
+  },
   "Vm": {
-    "VmxPath": "C:\\path\\to\\your\\vm.vmx",
-    "VmrunPath": "C:\\Program Files (x86)\\VMware\\VMware Workstation\\vmrun.exe",
-    "VmPassword": "",
-    "GuestUsername": "YourUser",
-    "GuestPassword": "YourPass"
+    "VmwareEnabled": false,
+    "GuestIpAddress": "<TARGET_IP>"
   },
   "KernelDebug": {
     "Transport": "kdnet",
@@ -75,325 +103,191 @@ Copy `src/WinDbgMCP.Server/appsettings.example.json` to `appsettings.json` and e
       "Port": 50000,
       "Key": "your.kdnet.key.here"
     },
-    "SymbolPath": "srv*C:\\Symbols*https://msdl.microsoft.com/download/symbols"
+    "SymbolPath": "srv*C:\\Symbols*https://msdl.microsoft.com/download/symbols",
+    "TranscriptDirectory": "C:\\tmp\\windbg-mcp\\transcripts"
   },
   "Guest": {
-    "FridaPort": 27042,
-    "DbgsrvPort": 5064
+    "FridaPort": 27042
   }
 }
 ```
 
-</details>
+`Target.Host` is the target/debuggee address. It is useful for status output and direct Frida documentation, but it is not an MCP endpoint. `Vm.GuestIpAddress` is kept as a legacy fallback for older configs.
 
-### 3. Add to Your MCP Client
+## Expected MCP Tool Surface
 
-**Claude Code** (`.mcp.json` in project root):
-```json
-{
-  "mcpServers": {
-    "windbg-mcp": {
-      "command": "dotnet",
-      "args": ["run", "--project", "C:\\path\\to\\windbg-mcp\\src\\WinDbgMCP.Server\\WinDbgMCP.Server.csproj"]
-    }
-  }
-}
-```
+With `Vm.VmwareEnabled=false` and `UserModeDebug.ServerSideToolsEnabled=false`, the useful MCP workflow is:
 
-**Claude Desktop** (`claude_desktop_config.json`):
-```json
-{
-  "mcpServers": {
-    "windbg-mcp": {
-      "command": "C:\\Program Files\\dotnet\\dotnet.exe",
-      "args": ["run", "--project", "C:\\path\\to\\windbg-mcp\\src\\WinDbgMCP.Server\\WinDbgMCP.Server.csproj"]
-    }
-  }
-}
-```
-
-### 4. Run
-
-The server starts automatically when your MCP client connects. It communicates over stdio.
-
-```bash
-# Or run standalone for testing
-dotnet run --project src/WinDbgMCP.Server/WinDbgMCP.Server.csproj
-```
-
-## Tool Catalog (29 tools)
-
-### Meta
-| Tool | Description |
-|---|---|
-| `get_system_state` | Full state overview — VM power, KD, guest ops, UMD. Always allowed. |
-
-### VM Tools (8)
-| Tool | Description |
-|---|---|
-| `vm_start` | Power on the VM |
-| `vm_stop` | Shut down (graceful or hard) |
-| `vm_pause` | Freeze entire VM |
-| `vm_resume` | Unpause a paused VM |
-| `vm_snapshot_restore` | Restore a named snapshot (debug sessions are cleanly torn down and can reconnect after) |
-| `vm_snapshot_list` | List available snapshots |
-| `vm_screenshot` | Capture VM display as PNG |
-| `vm_set_target` | Switch the active VM target at runtime (VMX path + credentials) |
-
-### Kernel Debug Tools (7)
-| Tool | Description |
-|---|---|
-| `kd_connect` | Attach to kernel via KDNET. Target breaks on connect. |
-| `kd_disconnect` | Detach from kernel. Resumes target so VM keeps running. |
-| `kd_break` | Halt running target (Ctrl+Break) |
-| `kd_continue` | Resume target execution |
-| `kd_step` | Step one instruction (into or over) |
-| `kd_execute` | Run any WinDbg command (`k`, `r`, `lm`, `!process 0 0`, `!analyze -v`, etc.) |
-| `kd_wait_for_event` | Wait for breakpoint/exception with timeout. Always returns. |
-
-### Guest Tools (5)
-| Tool | Description |
-|---|---|
-| `guest_run_command` | Execute command in guest OS, capture stdout/stderr |
-| `guest_transfer_to_vm` | Copy file from host to guest |
-| `guest_transfer_from_vm` | Copy file from guest to host |
-| `guest_list_processes` | List running processes with PIDs |
-| `guest_kill_process` | Kill a process by PID |
-
-### User-Mode Debug Tools (8)
-| Tool | Description |
-|---|---|
-| `umd_frida_attach` | Attach Frida to a guest process |
-| `umd_frida` | Inject JS, eval expressions, list processes, detach |
-| `umd_frida_skill` | Frida best practices and API reference for LLMs |
-| `umd_dbgsrv_connect` | Connect to remote dbgsrv in guest |
-| `umd_dbgsrv_execute` | Attach to PID, run WinDbg commands, detach |
-| `umd_dbgsrv_skill` | dbgsrv best practices and WinDbg command reference for LLMs |
-| `umd_ttd` | Time Travel Debugging — record, stop, retrieve, list traces |
-| `umd_ttd_query` | Query TTD traces *(not yet implemented)* |
-
-## Example Workflows
-
-### Inspect a Running Kernel
-
-```
+```text
 get_system_state
 kd_connect
-kd_execute("lm")                    # list loaded modules
-kd_execute("!process 0 0")          # list all processes
-kd_execute("vertarget")             # target version info
 kd_disconnect
+kd_break
+kd_continue
+kd_step
+kd_execute
+kd_symbol_status
+kd_find_process_by_name
+kd_find_process_by_name_raw
+kd_list_threads
+kd_list_threads_raw
+kd_switch_process
+kd_switch_thread
+kd_stack
+kd_stack_process_thread
+kd_wait_for_event
 ```
 
-### Set Breakpoint and Catch It
+Do not use MCP for `vm_*`, `guest_*`, `umd_frida_*`, `umd_dbgsrv_*`, `umd_ttd`, snapshots, screenshots, or VMware file transfer in this deployment.
 
-```
+## KD Workflow
+
+Minimal attach and inspection flow:
+
+```text
+get_system_state
 kd_connect
-kd_execute("bp nt!NtCreateFile")    # set breakpoint
-kd_continue                          # let target run
-kd_wait_for_event(30)               # wait up to 30s for hit
-kd_execute("k")                     # show call stack
-kd_execute("r")                     # show registers
+kd_break
+kd_execute command="lm"
+kd_execute command="k"
+kd_execute command="r"
+kd_continue
 kd_disconnect
 ```
 
-### Deploy and Debug a Driver
+To inspect a user process such as LSASS from KD, break the whole target first, then switch debugger context:
 
-```
-guest_transfer_to_vm("MyDriver.sys", "C:\\Windows\\System32\\drivers\\MyDriver.sys")
-guest_run_command("sc create MyDrv type= kernel binPath= C:\\Windows\\System32\\drivers\\MyDriver.sys")
-guest_run_command("sc start MyDrv")
-kd_connect
-kd_execute("lm m MyDrv")            # verify driver loaded
-kd_execute("bp MyDrv!DriverEntry")
-kd_disconnect
-```
-
-### Hook a Function with Frida
-
-```
-umd_frida_skill                      # read best practices first
-umd_frida_attach(processName="target.exe")
-umd_frida(action="eval", code="Process.enumerateModules().map(m=>m.name)")
-umd_frida(action="inject", code="""
-  Interceptor.attach(Module.getExportByName('kernel32.dll','CreateFileW'), {
-    onEnter(args) { console.log('CreateFileW: ' + args[0].readUtf16String()); }
-  });
-  console.log('Hook installed');
-""", timeoutSeconds=10)
-umd_frida(action="detach")
+```text
+kd_break
+kd_symbol_status
+kd_find_process_by_name name="lsass.exe"
+kd_list_threads process="<EPROCESS>"
+kd_stack_process_thread process="<EPROCESS>" thread="<ETHREAD>" command="kv"
+kd_continue
 ```
 
-### Inspect a Process with dbgsrv
+`kd_execute` accepts normal inspection commands such as `lm`, `r`, `k`, `dq`, `dd`, `db`, `u`, `x`, `.reload`, `!process 0 0`, and `!analyze -v`. Execution-control commands such as `g`, `p`, and `t` are blocked; use `kd_continue` and `kd_step`.
 
-```
-umd_dbgsrv_skill                     # read best practices first
-guest_run_command("start /b C:\\Tools\\DbgSrv\\dbgsrv.exe -t tcp:port=5064")
-umd_dbgsrv_connect(vmIpAddress="192.168.x.x")
-umd_dbgsrv_execute(action="attach", argument="<PID>")
-umd_dbgsrv_execute(action="command", argument="lm")
-umd_dbgsrv_execute(action="command", argument="!peb")
-umd_dbgsrv_execute(action="command", argument="~*k")
-umd_dbgsrv_execute(action="detach")
-umd_dbgsrv_execute(action="disconnect")
-```
+## Symbol Problems And Raw Fallback
 
-### Crash Analysis
+If `kd_find_process_by_name`, `kd_list_threads`, or `!process` reports incomplete symbols:
 
-```
-kd_connect                           # connect after BSOD
-kd_execute("!analyze -v")           # automated crash analysis
-kd_execute("k")                     # faulting stack
-kd_execute("r")                     # registers at crash
-kd_execute(".trap")                 # switch to trap frame
-kd_disconnect
+```text
+kd_symbol_status
+kd_execute command=".symfix"
+kd_execute command=".reload /f nt"
+kd_execute command="lm vm nt"
 ```
 
-## Architecture
+If `nt` still shows export-only symbols, `!process` may remain unusable even though KD itself works. Use the raw helpers only with offsets confirmed for the exact target build.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      MCP Client (LLM)                       │
-│                  Claude Code / Claude Desktop                │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ stdio (JSON-RPC)
-┌──────────────────────────▼──────────────────────────────────┐
-│                    WinDbgMCP.Server                          │
-│                                                              │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │  VM Tools    │  │  KD Tools    │  │  Guest Tools     │  │
-│  │  (vmrun)     │  │  (DbgEng)    │  │  (vmrun guest)   │  │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────────┘  │
-│         │                 │                  │               │
-│  ┌──────▼───────┐  ┌──────▼───────┐  ┌──────▼───────────┐  │
-│  │ VmwareManager│  │ DbgEngManager│  │ GuestExecManager │  │
-│  └──────────────┘  └──────┬───────┘  └──────────────────┘  │
-│                           │                                  │
-│  ┌────────────────────────▼─────────────────────────────┐   │
-│  │              StateCoordinator                         │   │
-│  │   (precondition gate — validates every tool call)     │   │
-│  └───────────────────────────────────────────────────────┘   │
-│                                                              │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │ UMD: Frida   │  │ UMD: dbgsrv  │  │ UMD: TTD         │  │
-│  │ (frida CLI)  │  │ (DbgEng COM) │  │ (TTD.exe)        │  │
-│  └──────────────┘  └──────────────┘  └──────────────────┘  │
-└──────────────────────────────────────────────────────────────┘
-         │                    │                    │
-         ▼                    ▼                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   Windows Guest VM                           │
-│              (VMware Workstation Pro)                         │
-│                                                              │
-│  KDNET (:50000)  │  frida-server (:27042)  │  dbgsrv (:5064)│
-└─────────────────────────────────────────────────────────────┘
+Offsets observed in `issue.md` for one Windows Server 2022 build were:
+
+```text
+EPROCESS + 0x480 = UniqueProcessId
+EPROCESS + 0x488 = ActiveProcessLinks
+EPROCESS + 0x5e8 = ImageFileName
+EPROCESS + 0x620 = ThreadListHead
 ```
 
-### Key Design Principles
+Those offsets are not universal. Confirm ETHREAD offsets separately before using `kd_list_threads_raw`.
 
-1. **Every tool validates preconditions** — `StateCoordinator` checks VM power, KD state, guest ops availability before any operation executes
-2. **Every operation has a timeout** — no blocking calls, ever. The LLM never hangs.
-3. **Error messages are prompts** — every error tells the LLM exactly what to do next
-4. **Execution-control commands are blocked** — `g`, `t`, `p` are blocked in `kd_execute`; use `kd_continue`/`kd_step` instead
-5. **DbgEng COM thread affinity** — all COM calls marshaled to a dedicated MTA thread with an event pump
-6. **BSOD detection** — bugchecks are detected and handled differently from normal breakpoints
-7. **Snapshot restore resets everything** — KD, Frida, dbgsrv sessions are all cleaned up
+Raw fallback example:
 
-## VM Setup
-
-### Enable KDNET (Kernel Debugging)
-
-In the guest VM (elevated cmd):
-
-```cmd
-bcdedit /debug on
-bcdedit /dbgsettings net hostip:<HOST_IP> port:50000 key:<YOUR_KEY>
-shutdown /r /t 0
+```text
+kd_find_process_by_name_raw name="lsass.exe" uniquePidOffset="0x480" activeLinksOffset="0x488" imageNameOffset="0x5e8"
+kd_list_threads_raw process="<EPROCESS>" threadListHeadOffset="0x620" threadListEntryOffset="<ETHREAD.ThreadListEntry>" cidPidOffset="<ETHREAD.ClientId.UniqueProcess>" cidTidOffset="<ETHREAD.ClientId.UniqueThread>"
+kd_stack_process_thread process="<EPROCESS>" thread="<ETHREAD>" command="kv"
 ```
 
-Generate a key with `kdnet.exe` from the Windows SDK, or use any dotted-quad format key.
+If `.process /r /p` says `PEB address is NULL` or `.thread` says it cannot retrieve thread context, a kernel stack can still be valid while user-mode frames are unavailable in that KD session.
 
-### Install Frida Server (Optional)
+## Transcripts
 
-On the **host**:
-```bash
-pip install frida-tools
-```
-
-Download `frida-server-<version>-windows-x86_64.exe` from [Frida releases](https://github.com/frida/frida/releases), deploy to guest as `C:\Tools\frida-server.exe`, and run:
-```cmd
-frida-server.exe -l 0.0.0.0:27042
-```
-
-### Install dbgsrv (Optional)
-
-Copy `dbgsrv.exe`, `dbgeng.dll`, and `dbghelp.dll` from WinDbg Preview (or Windows SDK) to the guest, then run:
-```cmd
-dbgsrv.exe -t tcp:port=5064
-```
-
-### Firewall
-
-The host firewall must allow:
-- UDP port 50000 inbound (KDNET)
-- TCP port 27042 outbound (Frida)
-- TCP port 5064 outbound (dbgsrv)
-
-## Project Structure
-
-```
-src/WinDbgMCP.Server/
-├── Program.cs                    # Entry point, MCP server setup, DI
-├── appsettings.json              # Configuration (VM creds, KDNET, timeouts)
-├── Configuration/
-│   └── ServerConfig.cs           # Typed configuration model
-├── State/
-│   ├── SystemState.cs            # State model + enums
-│   ├── StateCoordinator.cs       # Precondition gate (heart of system)
-│   ├── ErrorMessages.cs          # LLM-friendly error catalog
-│   └── ToolResult.cs             # Result type
-├── Vmware/
-│   └── VmwareManager.cs          # vmrun wrapper
-├── KernelDebug/
-│   ├── DbgEngThread.cs           # Dedicated MTA thread for COM
-│   ├── DbgEngManager.cs          # Kernel debug session manager
-│   ├── DebugEventCallbacks.cs    # Breakpoint/exception/module events
-│   ├── OutputCapture.cs          # Command output capture
-│   └── Interop/                  # P/Invoke, constants
-├── Guest/
-│   └── GuestExecManager.cs       # Guest command execution + file transfer
-├── UserModeDebug/
-│   ├── FridaManager.cs           # Frida CLI wrapper
-│   ├── DbgsrvManager.cs          # Remote user-mode debugging via dbgsrv
-│   └── TtdManager.cs             # Time Travel Debugging
-└── Tools/
-    ├── VmTools.cs                # vm_* tools
-    ├── KernelDebugTools.cs       # kd_* tools
-    ├── GuestTools.cs             # guest_* tools
-    ├── UserModeDebugTools.cs     # umd_* tools
-    └── MetaTools.cs              # get_system_state
-
-src/WinDbgMCP.Tests/              # Unit tests (126 tests)
-```
-
-## Running Tests
+For exact WinDbg command output saved by the server:
 
 ```bash
-dotnet test src/WinDbgMCP.Tests/WinDbgMCP.Tests.csproj
+python scripts/mcp_client.py kd_execute '{"command":"!process 0 0","saveTranscript":true}'
 ```
 
-## Tech Stack
+The returned path points under `KernelDebug.TranscriptDirectory`.
 
-| Component | Technology |
-|---|---|
-| Runtime | .NET 8 (C#) |
-| MCP SDK | [ModelContextProtocol](https://github.com/modelcontextprotocol/csharp-sdk) 0.1.0-preview.12 |
-| DbgEng | Native COM interop (`dbgeng.dll`) |
-| VM Control | VMware vmrun CLI |
-| User-Mode Hooking | Frida (frida-tools Python CLI) |
-| Remote Debugging | dbgsrv.exe (WinDbg component) |
-| TTD | TTD.exe (Time Travel Debugging) |
+For exact MCP JSON-RPC request/response records from the client smoke test:
 
-## License
+```bash
+UV_CACHE_DIR=/tmp/uv-cache UV_TOOL_DIR=/tmp/uv-tools \
+  uv run scripts/smoke_test.py --kd --trace-json --transcript /tmp/windbg-kd-smoke.jsonl
+```
 
-MIT
+## Direct Frida
+
+Run Frida from the operator/LLM host directly to the target/debuggee:
+
+```bash
+frida-ps -H <TARGET_IP>:27042
+frida -H <TARGET_IP>:27042 -n notepad.exe
+frida -H <TARGET_IP>:27042 -p <PID>
+```
+
+If Frida times out, check connectivity from the operator/LLM host to `<TARGET_IP>:27042`, target firewall rules, that `frida-server` is running on the target, and that local Frida tools match the target `frida-server` version.
+
+For Frida 17 JavaScript, prefer:
+
+```js
+const addr = Process.getModuleByName('ntdll.dll').getExportByName('NtClose');
+```
+
+or:
+
+```js
+const addr = Module.getGlobalExportByName('NtClose');
+```
+
+## Helper Scripts
+
+The scripts in `scripts/` are MCP/SSE helpers for the debugger host. They do not manage direct Frida.
+
+Read-only MCP check:
+
+```bash
+UV_CACHE_DIR=/tmp/uv-cache UV_TOOL_DIR=/tmp/uv-tools uv run scripts/smoke_test.py
+```
+
+Side-effecting KD smoke test:
+
+```bash
+UV_CACHE_DIR=/tmp/uv-cache UV_TOOL_DIR=/tmp/uv-tools \
+  uv run scripts/smoke_test.py --kd --trace-json --command k --command r
+```
+
+Leave the target broken for manual follow-up:
+
+```bash
+UV_CACHE_DIR=/tmp/uv-cache UV_TOOL_DIR=/tmp/uv-tools \
+  uv run scripts/smoke_test.py --kd --trace-json --leave-broken --no-disconnect
+```
+
+Raw tool calls:
+
+```bash
+python scripts/mcp_client.py get_system_state
+python scripts/mcp_client.py kd_symbol_status
+python scripts/mcp_client.py kd_find_process_by_name '{"name":"lsass.exe"}'
+python scripts/mcp_client.py kd_stack_process_thread '{"process":"<EPROCESS>","thread":"<ETHREAD>","command":"kv"}'
+```
+
+## Development
+
+Build:
+
+```bash
+dotnet build src/WinDbgMCP.Server/WinDbgMCP.Server.csproj
+```
+
+Test:
+
+```bash
+DOTNET_ROLL_FORWARD=Major dotnet test src/WinDbgMCP.Tests/WinDbgMCP.Tests.csproj
+```
+
+`DOTNET_ROLL_FORWARD=Major` is only needed on hosts that do not have the .NET 8 runtime installed.

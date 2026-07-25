@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Text;
 using ModelContextProtocol.Server;
+using WinDbgMCP.Server.Configuration;
 using WinDbgMCP.Server.State;
 
 namespace WinDbgMCP.Server.Tools;
@@ -9,78 +10,83 @@ namespace WinDbgMCP.Server.Tools;
 public static class MetaTools
 {
     [McpServerTool(Name = "get_system_state", ReadOnly = true), Description(
-        "Returns the complete state of the system: VM power, VMware Tools, kernel debugger, " +
-        "guest operations availability, and user-mode debug sessions. " +
-        "ALWAYS allowed — call this whenever you're unsure about the current state.")]
+        "Returns current WinDbgMCP state: deployment mode, target host, kernel debugger status, " +
+        "direct Frida note, and availability flags. Always safe to call first.")]
     public static async Task<string> GetSystemState(
         StateCoordinator state,
+        ServerConfig config,
         CancellationToken ct = default)
     {
-        await state.RefreshStateAsync();
+        ct.ThrowIfCancellationRequested();
+
+        try
+        {
+            await state.RefreshStateAsync();
+        }
+        catch (Exception ex)
+        {
+            return "=== SYSTEM STATE ===\n\n" +
+                   $"State refresh failed: {ex.GetType().Name}: {ex.Message}\n" +
+                   "The MCP server is reachable, but one of its local probes failed.";
+        }
+
         var s = state.State;
+        var targetHost = !string.IsNullOrWhiteSpace(config.Target.Host)
+            ? config.Target.Host
+            : config.Vm.GuestIpAddress;
 
         var sb = new StringBuilder();
         sb.AppendLine("=== SYSTEM STATE ===");
         sb.AppendLine();
-
-        // VM
-        sb.AppendLine($"VM Power:          {s.VmPower}");
-        sb.AppendLine($"VMware Tools:      {s.VmTools}");
-        sb.AppendLine($"VM IP Address:     {s.VmIpAddress ?? "unknown"}");
+        sb.AppendLine($"Deployment:          {(config.Vm.VmwareEnabled ? "VMware/vmrun enabled" : "externally managed target (VmwareEnabled=false)")}");
+        sb.AppendLine($"Target Host:         {(string.IsNullOrWhiteSpace(targetHost) ? "unknown" : targetHost)}");
+        sb.AppendLine($"Direct Frida:        {(string.IsNullOrWhiteSpace(targetHost) ? "target host unknown" : $"operator host -> {targetHost}:{config.Guest.FridaPort}")}");
+        sb.AppendLine($"Server UMD Tools:    {(config.UserModeDebug.ServerSideToolsEnabled || config.Vm.VmwareEnabled ? "registered" : "not registered")}");
         sb.AppendLine();
 
-        // Kernel Debugger
-        sb.AppendLine($"KD Connected:      {s.KdConnected}");
-        if (s.KdConnected)
+        if (config.Vm.VmwareEnabled)
         {
-            sb.AppendLine($"KD Transport:      {s.KdTransportType}");
-            sb.AppendLine($"Execution Status:  {s.KdExecStatus}");
-
-            if (s.KdExecStatus == DebugExecutionStatus.Break)
-            {
-                sb.AppendLine($"Break Reason:      {s.KdBreakReason ?? "unknown"}");
-
-                if (s.IsBugcheck)
-                {
-                    sb.AppendLine($"BSOD DETECTED:     {s.BugcheckCode}");
-                    sb.AppendLine($"   The OS has CRASHED. Guest ops will NOT work.");
-                    sb.AppendLine($"   Run kd_execute('!analyze -v') or vm_snapshot_restore.");
-                }
-            }
-
-            sb.AppendLine($"Pending Events:    {s.PendingEventCount}");
-            sb.AppendLine($"Wait Pending:      {s.KdWaitPending}");
+            sb.AppendLine($"VM Power:            {s.VmPower}");
+            sb.AppendLine($"VMware Tools:        {s.VmTools}");
+            sb.AppendLine($"VM IP Address:       {s.VmIpAddress ?? "unknown"}");
+            sb.AppendLine($"Guest Ops Available: {s.GuestOpsAvailable}");
+            sb.AppendLine();
         }
-        sb.AppendLine();
-
-        // Guest operations
-        sb.AppendLine($"Guest Ops Available: {s.GuestOpsAvailable}");
-        if (!s.GuestOpsAvailable)
+        else
         {
-            if (s.VmPower != VmPowerState.Running)
-                sb.AppendLine($"   -> VM is {s.VmPower}");
-            else if (s.KdConnected && s.KdExecStatus == DebugExecutionStatus.Break)
-            {
-                if (s.IsBugcheck)
-                    sb.AppendLine($"   -> BSOD: OS has crashed");
-                else
-                    sb.AppendLine($"   -> Kernel debugger has frozen the VM (call kd_continue)");
-            }
-            else if (s.VmTools != VmToolsState.Running)
-                sb.AppendLine($"   -> VMware Tools: {s.VmTools}");
+            sb.AppendLine("VMware Backend:      disabled");
+            sb.AppendLine("VM/GUEST Tools:      not registered in this deployment");
+            sb.AppendLine("Target Reachability: managed outside WinDbgMCP");
+            sb.AppendLine();
         }
+
+        sb.AppendLine($"KD Connected:        {s.KdConnected}");
+        sb.AppendLine($"KD Transport:        {s.KdTransportType}");
+        sb.AppendLine($"KD Exec Status:      {s.KdExecStatus}");
+        sb.AppendLine($"KD Wait Pending:     {s.KdWaitPending}");
+        sb.AppendLine($"Pending Events:      {s.PendingEventCount}");
+        sb.AppendLine($"Bugcheck:            {s.IsBugcheck}");
         sb.AppendLine();
 
-        // User-mode debug
-        if (s.FridaState != null)
-            sb.AppendLine($"Frida:             {s.FridaState}");
-        if (s.DbgsrvState != null)
-            sb.AppendLine($"dbgsrv:            {s.DbgsrvState}");
+        if (config.UserModeDebug.ServerSideToolsEnabled || config.Vm.VmwareEnabled)
+        {
+            sb.AppendLine($"Frida:               {(s.FridaState == null ? "not attached" : s.FridaState)}");
+            sb.AppendLine($"dbgsrv:              {(s.DbgsrvState == null ? "not connected" : s.DbgsrvState)}");
+        }
+        else
+        {
+            sb.AppendLine("Frida:               direct from operator host, outside this MCP server");
+            sb.AppendLine("dbgsrv:              server-side MCP tool not registered");
+        }
+
         if (s.UserDebugSessions.Count > 0)
         {
+            sb.AppendLine();
             sb.AppendLine("Active Debug Sessions:");
             foreach (var session in s.UserDebugSessions)
-                sb.AppendLine($"   - [{session.Type}] PID {session.Pid} ({session.ProcessName})");
+            {
+                sb.AppendLine($" - [{session.Type}] PID {session.Pid} ({session.ProcessName})");
+            }
         }
 
         return sb.ToString();

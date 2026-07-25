@@ -42,12 +42,17 @@ public sealed class VmwareManager
         _security = config.Security;
         _logger = logger;
 
-        // Validate vmrun exists at startup
-        if (!File.Exists(_vmrunPath))
+        // Validate vmrun exists at startup — but only when VMware integration is
+        // enabled. In VMware-disabled mode the VM is managed externally and vmrun is
+        // never invoked, so a missing vmrun must NOT prevent construction: every tool
+        // depends (transitively, via StateCoordinator) on this service, so throwing
+        // here would break the kernel-debug and Frida tools too.
+        if (config.Vm.VmwareEnabled && !File.Exists(_vmrunPath))
         {
             throw new FileNotFoundException(
                 $"vmrun not found at '{_vmrunPath}'. " +
-                "Install VMware Workstation Pro and verify the vmrunPath in appsettings.json.",
+                "Install VMware Workstation Pro and verify the vmrunPath in appsettings.json, " +
+                "or set Vm.VmwareEnabled=false to run without VMware (kernel debugging + Frida only).",
                 _vmrunPath);
         }
     }
