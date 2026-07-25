@@ -4,11 +4,39 @@ This setup uses a Windows debugger host for WinDbgMCP/DbgEng and a separate Wind
 
 ## Debugger Host
 
-Install .NET 8 SDK, Windows debugging components, Node.js, and `mcp-proxy`.
+Install .NET 8 SDK
+
+```powershell
+winget install `
+  --id Microsoft.DotNet.SDK.8 `
+  --source winget `
+  --accept-source-agreements `
+  --accept-package-agreements
+```
+
+Install Windows debugging components : https://learn.microsoft.com/en-us/windows/apps/windows-sdk/
+
+Install Chocolatey : https://chocolatey.org/install
+
+Install Node.js, and `mcp-proxy`
 
 ```powershell
 choco install nodejs
 npm install -g mcp-proxy
+```
+
+Confirm nuget source is not empty :
+
+```powershell
+dotnet nuget list source
+Sources inscrites :
+  1.  nuget.org [Activé]
+      https://api.nuget.org/v3/index.json
+```
+If empty : 
+
+```powershell
+dotnet nuget add source https://api.nuget.org/v3/index.json --name nuget.org
 ```
 
 Build from source:
@@ -16,6 +44,8 @@ Build from source:
 ```powershell
 dotnet build src\WinDbgMCP.Server\WinDbgMCP.Server.csproj
 ```
+
+
 
 Or publish a self-contained single-file EXE:
 
