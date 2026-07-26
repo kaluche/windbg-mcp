@@ -47,8 +47,11 @@ public static class KernelDebugTools
         }
         catch (OperationCanceledException)
         {
-            return "kd_connect timed out. The kernel debug target did not respond within " +
-                   $"{config.Timeouts.KdConnectSeconds}s. Verify: " +
+            var totalTimeout = DbgEngManager.GetConnectOperationTimeout(config.Timeouts).TotalSeconds;
+            return "kd_connect timed out. The kernel debug target did not complete attach/initial-break within " +
+                   $"{totalTimeout:0}s " +
+                   $"(attach budget {config.Timeouts.KdConnectSeconds}s, initial-break budget " +
+                   $"{config.Timeouts.KdInitialBreakSeconds}s). Verify: " +
                    "(1) VM is running with debug boot enabled (bcdedit /debug on + KDNET configured). " +
                    "(2) The KDNET port/key matches appsettings.json. " +
                    "(3) No other debugger is already attached. " +
@@ -99,6 +102,7 @@ public static class KernelDebugTools
         try
         {
             var result = await dbgEng.BreakAsync();
+            state.SetKdBroken("Manual break");
 
             // Check for BSOD after break
             var (isBugcheck, bugcheckCode) = await dbgEng.DetectBugcheckAsync();
@@ -136,7 +140,9 @@ public static class KernelDebugTools
 
         try
         {
-            return await dbgEng.ContinueAsync();
+            var result = await dbgEng.ContinueAsync();
+            state.SetKdRunning();
+            return result;
         }
         catch (OperationCanceledException)
         {
@@ -1068,6 +1074,7 @@ Raw output:
             // Check for BSOD if we received an event
             if (result.Contains("halted", StringComparison.OrdinalIgnoreCase))
             {
+                state.SetKdBroken("Debug event");
                 var (isBugcheck, bugcheckCode) = await dbgEng.DetectBugcheckAsync();
                 if (isBugcheck)
                 {
@@ -1075,6 +1082,10 @@ Raw output:
                     return result + $"\n\nWARNING: BSOD DETECTED (bugcheck {bugcheckCode}). " +
                            "The OS has crashed. Use kd_execute('!analyze -v') to investigate.";
                 }
+            }
+            else if (result.Contains("Target is still running", StringComparison.OrdinalIgnoreCase))
+            {
+                state.SetKdRunning();
             }
 
             return result;

@@ -42,6 +42,7 @@ public sealed class StateCoordinator
     public Func<TimeSpan, Task<bool>>? AreToolsRunningAsync { get; set; }
     public Func<DebugExecutionStatus>? GetDbgEngExecutionStatus { get; set; }
     public Func<bool>? IsDbgEngConnected { get; set; }
+    public Func<KdTransport>? GetDbgEngTransport { get; set; }
     public Func<int>? GetPendingEventCount { get; set; }
 
     // User-mode debug state delegates
@@ -144,9 +145,23 @@ public sealed class StateCoordinator
     /// </summary>
     public async Task RefreshStateAsync()
     {
-        // 1. DbgEng execution status — single COM call, ~microseconds
-        if (_state.KdConnected && IsDbgEngConnected?.Invoke() == true)
+        // 1. DbgEng connection and execution status.
+        // Reconcile from the manager even if the state coordinator missed a
+        // connect result, for example when a client-side timeout abandoned
+        // kd_connect while the DbgEng thread later completed the attach.
+        var dbgEngConnected = IsDbgEngConnected?.Invoke();
+        if (dbgEngConnected == true)
         {
+            if (!_state.KdConnected)
+            {
+                _logger.LogWarning("State coordinator recovered a live kernel debugger connection.");
+                _state.KdConnected = true;
+            }
+
+            var transport = GetDbgEngTransport?.Invoke() ?? KdTransport.None;
+            if (transport != KdTransport.None)
+                _state.KdTransportType = transport;
+
             var status = GetDbgEngExecutionStatus?.Invoke() ?? DebugExecutionStatus.Uninitialized;
             _state.KdExecStatus = status;
 
@@ -156,10 +171,21 @@ public sealed class StateCoordinator
             {
                 _logger.LogWarning("Kernel debugger connection lost (NoDebuggee detected)");
                 _state.KdConnected = false;
+                _state.KdTransportType = KdTransport.None;
                 _state.KdBreakReason = null;
                 _state.IsBugcheck = false;
                 _state.BugcheckCode = null;
             }
+        }
+        else if (_state.KdConnected && dbgEngConnected == false)
+        {
+            _logger.LogWarning("Kernel debugger connection lost (manager is disconnected)");
+            _state.KdConnected = false;
+            _state.KdTransportType = KdTransport.None;
+            _state.KdExecStatus = DebugExecutionStatus.NoDebuggee;
+            _state.KdBreakReason = null;
+            _state.IsBugcheck = false;
+            _state.BugcheckCode = null;
         }
 
         // 2. Event queue count
@@ -311,6 +337,32 @@ public sealed class StateCoordinator
     }
 
     /// <summary>
+    /// Update KD execution state after a successful resume.
+    /// </summary>
+    public void SetKdRunning()
+    {
+        if (!_state.KdConnected)
+            return;
+
+        _state.KdExecStatus = DebugExecutionStatus.Go;
+        _state.KdBreakReason = null;
+        _state.KdWaitPending = false;
+        _bsodCheckedForCurrentBreak = false;
+    }
+
+    /// <summary>
+    /// Update KD execution state after a successful break/event.
+    /// </summary>
+    public void SetKdBroken(string? reason = null)
+    {
+        if (!_state.KdConnected)
+            return;
+
+        _state.KdExecStatus = DebugExecutionStatus.Break;
+        _state.KdBreakReason = reason;
+    }
+
+    /// <summary>
     /// Update KD connection state after disconnect.
     /// </summary>
     public void SetKdDisconnected()
@@ -320,6 +372,7 @@ public sealed class StateCoordinator
         _state.KdExecStatus = DebugExecutionStatus.NoDebuggee;
         _state.KdBreakReason = null;
         _state.KdWaitPending = false;
+        _state.PendingEventCount = 0;
         _state.IsBugcheck = false;
         _state.BugcheckCode = null;
     }

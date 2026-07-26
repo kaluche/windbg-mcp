@@ -11,12 +11,21 @@ namespace WinDbgMCP.Server.KernelDebug;
 /// </summary>
 public sealed class DebugEventCallbacks : DebugBaseEventCallbacks
 {
+    private const uint StatusBreakpoint = 0x80000003;
+
     private readonly ConcurrentQueue<DebugEvent> _eventQueue = new();
     private volatile DEBUG_STATUS _lastExecutionStatus = DEBUG_STATUS.NO_DEBUGGEE;
     private volatile bool _hasBreakingEvent;
 
     public int PendingCount => _eventQueue.Count;
     public DEBUG_STATUS LastExecutionStatus => _lastExecutionStatus;
+    public void SetExecutionStatus(DEBUG_STATUS status) =>
+        _lastExecutionStatus = DbgEngEventHandling.NormalizeReportedExecutionStatus(status);
+    public void ClearEvents()
+    {
+        while (_eventQueue.TryDequeue(out _)) { }
+        _hasBreakingEvent = false;
+    }
 
     /// <summary>
     /// True if a breaking event (breakpoint, exception, system error) occurred
@@ -55,6 +64,20 @@ public sealed class DebugEventCallbacks : DebugBaseEventCallbacks
     {
         if (firstChance != 0)
         {
+            if ((uint)exception.ExceptionCode == StatusBreakpoint)
+            {
+                _hasBreakingEvent = true;
+                _eventQueue.Enqueue(new DebugEvent
+                {
+                    Type = DebugEventKind.ExceptionFirstChance,
+                    Details = $"Breakpoint exception 0x{(uint)exception.ExceptionCode:X8} at 0x{exception.ExceptionAddress:X16} " +
+                              "(first chance)",
+                    Address = (ulong)exception.ExceptionAddress
+                });
+
+                return DEBUG_STATUS.BREAK;
+            }
+
             // First-chance exceptions are routine in a running kernel.
             // Let the kernel handle them — don't break or set the flag.
             // The engine will continue waiting for the next event.
@@ -66,7 +89,7 @@ public sealed class DebugEventCallbacks : DebugBaseEventCallbacks
         _eventQueue.Enqueue(new DebugEvent
         {
             Type = DebugEventKind.ExceptionSecondChance,
-            Details = $"Exception 0x{exception.ExceptionCode:X8} at 0x{exception.ExceptionAddress:X16} " +
+            Details = $"Exception 0x{(uint)exception.ExceptionCode:X8} at 0x{exception.ExceptionAddress:X16} " +
                       "(second chance)",
             Address = (ulong)exception.ExceptionAddress
         });
@@ -161,7 +184,7 @@ public sealed class DebugEventCallbacks : DebugBaseEventCallbacks
     {
         if ((flags & DEBUG_CES.EXECUTION_STATUS) != 0)
         {
-            _lastExecutionStatus = (DEBUG_STATUS)argument;
+            _lastExecutionStatus = DbgEngEventHandling.NormalizeReportedExecutionStatus((DEBUG_STATUS)argument);
         }
         return HRESULT.S_OK;
     }

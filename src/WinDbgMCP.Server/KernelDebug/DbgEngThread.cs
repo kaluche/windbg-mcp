@@ -22,6 +22,25 @@ public sealed class DbgEngThread : IDisposable
     public Action? PumpEventsAction { get; set; }
 
     /// <summary>
+    /// Called immediately before the worker's final queue check and event-pump
+    /// wait. This lets the manager know that any newly queued work must wake
+    /// the pump.
+    /// </summary>
+    public Action? PumpArmingAction { get; set; }
+
+    /// <summary>
+    /// Called when the worker leaves the armed/pumping region.
+    /// </summary>
+    public Action? PumpDisarmedAction { get; set; }
+
+    /// <summary>
+    /// Called after a work item is queued while the pump is enabled, allowing
+    /// the manager to wake a blocking WaitForEvent without waiting for the
+    /// pump's periodic yield timer.
+    /// </summary>
+    public Action? WorkQueuedWhilePumpingAction { get; set; }
+
+    /// <summary>
     /// Whether event pumping is enabled (only when target is running).
     /// </summary>
     public volatile bool PumpEnabled;
@@ -66,11 +85,31 @@ public sealed class DbgEngThread : IDisposable
                 {
                     try
                     {
+                        PumpArmingAction?.Invoke();
+                        if (_workQueue.TryTake(out work, TimeSpan.FromMilliseconds(0)))
+                        {
+                            PumpDisarmedAction?.Invoke();
+                            try
+                            {
+                                work.Execute();
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogError(ex, "Work item failed on DbgEng thread");
+                                work.SetException(ex);
+                            }
+                            continue;
+                        }
+
                         PumpEventsAction();
                     }
                     catch (Exception ex)
                     {
                         _logger.LogWarning(ex, "Event pump iteration failed");
+                    }
+                    finally
+                    {
+                        PumpDisarmedAction?.Invoke();
                     }
                     continue;
                 }
@@ -121,6 +160,18 @@ public sealed class DbgEngThread : IDisposable
         cts.Token.Register(() => tcs.TrySetCanceled(), useSynchronizationContext: false);
 
         _workQueue.Add(item);
+        if (PumpEnabled)
+        {
+            try
+            {
+                WorkQueuedWhilePumpingAction?.Invoke();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Work-queued pump wake failed");
+            }
+        }
+
         return tcs.Task;
     }
 

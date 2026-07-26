@@ -10,7 +10,8 @@ internal enum DbgEngInterruptPurpose
     BreakWaitTimeout,
     StepTimeout,
     WaitForEventTimeout,
-    EventPumpYield
+    EventPumpYield,
+    DisconnectPumpWake
 }
 
 internal enum DbgEngWaitOutcome
@@ -24,6 +25,7 @@ internal enum DbgEngWaitOutcome
 internal enum DbgEngPumpOutcome
 {
     KeepPumping,
+    ResumeInternalYieldBreak,
     StopOnBreakingEvent,
     StopOnUnknownBreak,
     StopOnUnexpectedFailure
@@ -39,9 +41,18 @@ internal static class DbgEngEventHandling
     public const HRESULT E_PENDING = (HRESULT)0x8000000A;
 
     public static DEBUG_INTERRUPT GetInterrupt(DbgEngInterruptPurpose purpose) =>
-        purpose == DbgEngInterruptPurpose.ExplicitTargetBreak
+        purpose is DbgEngInterruptPurpose.ExplicitTargetBreak
+            or DbgEngInterruptPurpose.DisconnectPumpWake
             ? DEBUG_INTERRUPT.ACTIVE
             : DEBUG_INTERRUPT.EXIT;
+
+    public static DEBUG_STATUS GetContinueExecutionStatus() =>
+        DEBUG_STATUS.GO_HANDLED;
+
+    public static DEBUG_STATUS NormalizeReportedExecutionStatus(DEBUG_STATUS status) =>
+        status is DEBUG_STATUS.GO_HANDLED or DEBUG_STATUS.GO_NOT_HANDLED
+            ? DEBUG_STATUS.GO
+            : status;
 
     public static DbgEngWaitOutcome ClassifyWaitResult(HRESULT hr)
     {
@@ -66,7 +77,9 @@ internal static class DbgEngEventHandling
     public static DbgEngPumpOutcome ClassifyPumpResult(
         HRESULT waitHr,
         DEBUG_STATUS executionStatus,
-        bool hasBreakingEvent)
+        bool hasBreakingEvent,
+        bool internalYieldInterruptSucceeded,
+        bool explicitBreakInterruptPending)
     {
         var waitOutcome = ClassifyWaitResult(waitHr);
         if (waitOutcome is DbgEngWaitOutcome.Timeout or DbgEngWaitOutcome.ExitInterrupt)
@@ -77,6 +90,12 @@ internal static class DbgEngEventHandling
 
         if (executionStatus != DEBUG_STATUS.BREAK)
             return DbgEngPumpOutcome.KeepPumping;
+
+        if (!hasBreakingEvent && explicitBreakInterruptPending)
+            return DbgEngPumpOutcome.StopOnUnknownBreak;
+
+        if (!hasBreakingEvent && internalYieldInterruptSucceeded)
+            return DbgEngPumpOutcome.ResumeInternalYieldBreak;
 
         return hasBreakingEvent
             ? DbgEngPumpOutcome.StopOnBreakingEvent

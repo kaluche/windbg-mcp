@@ -1,5 +1,6 @@
 using ClrDebug;
 using ClrDebug.DbgEng;
+using WinDbgMCP.Server.Configuration;
 using WinDbgMCP.Server.KernelDebug;
 using WinDbgMCP.Server.State;
 
@@ -31,7 +32,9 @@ public class DbgEngEventHandlingTests
         var outcome = DbgEngEventHandling.ClassifyPumpResult(
             DbgEngEventHandling.E_PENDING,
             DEBUG_STATUS.GO,
-            hasBreakingEvent: false);
+            hasBreakingEvent: false,
+            internalYieldInterruptSucceeded: true,
+            explicitBreakInterruptPending: false);
 
         Assert.Equal(DbgEngPumpOutcome.KeepPumping, outcome);
     }
@@ -42,18 +45,48 @@ public class DbgEngEventHandlingTests
         var outcome = DbgEngEventHandling.ClassifyPumpResult(
             HRESULT.S_OK,
             DEBUG_STATUS.BREAK,
-            hasBreakingEvent: true);
+            hasBreakingEvent: true,
+            internalYieldInterruptSucceeded: true,
+            explicitBreakInterruptPending: false);
 
         Assert.Equal(DbgEngPumpOutcome.StopOnBreakingEvent, outcome);
     }
 
     [Fact]
-    public void EventPump_StopsOnUnknownBreakWithoutClassifyingItAsSynthetic()
+    public void EventPump_ResumesUnclassifiedBreakAfterInternalYieldInterrupt()
     {
         var outcome = DbgEngEventHandling.ClassifyPumpResult(
             HRESULT.S_OK,
             DEBUG_STATUS.BREAK,
-            hasBreakingEvent: false);
+            hasBreakingEvent: false,
+            internalYieldInterruptSucceeded: true,
+            explicitBreakInterruptPending: false);
+
+        Assert.Equal(DbgEngPumpOutcome.ResumeInternalYieldBreak, outcome);
+    }
+
+    [Fact]
+    public void EventPump_StopsOnUnclassifiedBreakWhenExplicitBreakIsPending()
+    {
+        var outcome = DbgEngEventHandling.ClassifyPumpResult(
+            HRESULT.S_OK,
+            DEBUG_STATUS.BREAK,
+            hasBreakingEvent: false,
+            internalYieldInterruptSucceeded: true,
+            explicitBreakInterruptPending: true);
+
+        Assert.Equal(DbgEngPumpOutcome.StopOnUnknownBreak, outcome);
+    }
+
+    [Fact]
+    public void EventPump_StopsOnUnknownBreakWithoutInternalYieldInterrupt()
+    {
+        var outcome = DbgEngEventHandling.ClassifyPumpResult(
+            HRESULT.S_OK,
+            DEBUG_STATUS.BREAK,
+            hasBreakingEvent: false,
+            internalYieldInterruptSucceeded: false,
+            explicitBreakInterruptPending: false);
 
         Assert.Equal(DbgEngPumpOutcome.StopOnUnknownBreak, outcome);
     }
@@ -64,7 +97,9 @@ public class DbgEngEventHandlingTests
         var outcome = DbgEngEventHandling.ClassifyPumpResult(
             HRESULT.E_FAIL,
             DEBUG_STATUS.GO,
-            hasBreakingEvent: false);
+            hasBreakingEvent: false,
+            internalYieldInterruptSucceeded: false,
+            explicitBreakInterruptPending: false);
 
         Assert.Equal(DbgEngPumpOutcome.StopOnUnexpectedFailure, outcome);
     }
@@ -75,6 +110,37 @@ public class DbgEngEventHandlingTests
         Assert.Equal(
             DEBUG_INTERRUPT.ACTIVE,
             DbgEngEventHandling.GetInterrupt(DbgEngInterruptPurpose.ExplicitTargetBreak));
+    }
+
+    [Fact]
+    public void ContinueFromBreak_UsesGoHandled()
+    {
+        Assert.Equal(
+            DEBUG_STATUS.GO_HANDLED,
+            DbgEngEventHandling.GetContinueExecutionStatus());
+    }
+
+    [Theory]
+    [InlineData((int)DEBUG_STATUS.GO, (int)DEBUG_STATUS.GO)]
+    [InlineData((int)DEBUG_STATUS.GO_HANDLED, (int)DEBUG_STATUS.GO)]
+    [InlineData((int)DEBUG_STATUS.GO_NOT_HANDLED, (int)DEBUG_STATUS.GO)]
+    [InlineData((int)DEBUG_STATUS.BREAK, (int)DEBUG_STATUS.BREAK)]
+    public void InstructionOnlyExecutionStatuses_NormalizeToReportedGo(
+        int inputValue,
+        int expectedValue)
+    {
+        var input = (DEBUG_STATUS)inputValue;
+        var expected = (DEBUG_STATUS)expectedValue;
+
+        Assert.Equal(expected, DbgEngEventHandling.NormalizeReportedExecutionStatus(input));
+    }
+
+    [Fact]
+    public void DisconnectPumpWake_UsesActiveInterrupt()
+    {
+        Assert.Equal(
+            DEBUG_INTERRUPT.ACTIVE,
+            DbgEngEventHandling.GetInterrupt(DbgEngInterruptPurpose.DisconnectPumpWake));
     }
 
     [Theory]
@@ -88,6 +154,29 @@ public class DbgEngEventHandlingTests
         var purpose = (DbgEngInterruptPurpose)purposeValue;
 
         Assert.Equal(DEBUG_INTERRUPT.EXIT, DbgEngEventHandling.GetInterrupt(purpose));
+    }
+
+    [Fact]
+    public void ConnectOperationTimeout_IncludesAttachAndInitialBreakBudgets()
+    {
+        var timeouts = new TimeoutConfig
+        {
+            KdConnectSeconds = 30,
+            KdInitialBreakSeconds = 15
+        };
+
+        Assert.Equal(TimeSpan.FromSeconds(50), DbgEngManager.GetConnectOperationTimeout(timeouts));
+    }
+
+    [Fact]
+    public void BreakOperationTimeout_IncludesBreakWaitAndPumpYieldBudget()
+    {
+        var timeouts = new TimeoutConfig
+        {
+            KdBreakSeconds = 10
+        };
+
+        Assert.Equal(TimeSpan.FromSeconds(13), DbgEngManager.GetBreakOperationTimeout(timeouts));
     }
 
     [Fact]
@@ -105,6 +194,50 @@ public class DbgEngEventHandlingTests
         Assert.Equal(DEBUG_STATUS.GO_NOT_HANDLED, status);
         Assert.False(callbacks.HasBreakingEvent);
         Assert.Equal(0, callbacks.PendingCount);
+    }
+
+    [Fact]
+    public void FirstChanceBreakpointException_IsCaptured()
+    {
+        var callbacks = new DebugEventCallbacks();
+        var exception = new EXCEPTION_RECORD64
+        {
+            ExceptionCode = (NTSTATUS)0x80000003,
+            ExceptionAddress = unchecked((long)0xFFFFF8017BAFA0D0)
+        };
+
+        var status = callbacks.Exception(ref exception, firstChance: 1);
+
+        Assert.Equal(DEBUG_STATUS.BREAK, status);
+        Assert.True(callbacks.HasBreakingEvent);
+        Assert.Equal(1, callbacks.PendingCount);
+    }
+
+    [Fact]
+    public void DebugEventCallbacks_ClearEventsDrainsQueueAndBreakingFlag()
+    {
+        var callbacks = new DebugEventCallbacks();
+        var exception = new EXCEPTION_RECORD64
+        {
+            ExceptionCode = (NTSTATUS)0x80000003,
+            ExceptionAddress = unchecked((long)0xFFFFF8017BAFA0D0)
+        };
+        callbacks.Exception(ref exception, firstChance: 1);
+
+        callbacks.ClearEvents();
+
+        Assert.False(callbacks.HasBreakingEvent);
+        Assert.Equal(0, callbacks.PendingCount);
+    }
+
+    [Fact]
+    public void DebugEventCallbacks_SetExecutionStatusUpdatesCachedStatus()
+    {
+        var callbacks = new DebugEventCallbacks();
+
+        callbacks.SetExecutionStatus(DEBUG_STATUS.BREAK);
+
+        Assert.Equal(DEBUG_STATUS.BREAK, callbacks.LastExecutionStatus);
     }
 
     [Fact]

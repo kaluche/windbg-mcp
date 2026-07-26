@@ -54,6 +54,7 @@ builder.Services.AddSingleton<StateCoordinator>(sp =>
         GetVmPowerStateAsync = () => vmware.GetPowerStateAsync(),
         AreToolsRunningAsync = timeout => vmware.AreToolsRunningAsync(timeout),
         IsDbgEngConnected = () => dbgEng.IsConnected,
+        GetDbgEngTransport = () => dbgEng.CurrentTransport,
         GetDbgEngExecutionStatus = () => dbgEng.GetExecutionStatus(),
         GetPendingEventCount = () => dbgEng.PendingEventCount,
         IsFridaAttached = () => frida.IsAttached,

@@ -18,6 +18,7 @@ public class StateCoordinatorTests : IDisposable
     private bool _toolsRunning = true;
     private DebugExecutionStatus _execStatus = DebugExecutionStatus.NoDebuggee;
     private bool _dbgEngConnected = false;
+    private KdTransport _dbgEngTransport = KdTransport.None;
     private int _pendingEventCount = 0;
     private bool _fridaAttached = false;
     private string? _fridaTarget = null;
@@ -39,6 +40,7 @@ public class StateCoordinatorTests : IDisposable
         _coordinator.GetVmPowerStateAsync = () => Task.FromResult(_vmPower);
         _coordinator.AreToolsRunningAsync = _ => Task.FromResult(_toolsRunning);
         _coordinator.IsDbgEngConnected = () => _dbgEngConnected;
+        _coordinator.GetDbgEngTransport = () => _dbgEngTransport;
         _coordinator.GetDbgEngExecutionStatus = () => _execStatus;
         _coordinator.GetPendingEventCount = () => _pendingEventCount;
         _coordinator.IsFridaAttached = () => _fridaAttached;
@@ -74,6 +76,7 @@ public class StateCoordinatorTests : IDisposable
     private void SetKdConnectedBroken()
     {
         _dbgEngConnected = true;
+        _dbgEngTransport = KdTransport.KDNET;
         _execStatus = DebugExecutionStatus.Break;
         _coordinator.SetKdConnected(KdTransport.KDNET);
     }
@@ -81,6 +84,7 @@ public class StateCoordinatorTests : IDisposable
     private void SetKdConnectedRunning()
     {
         _dbgEngConnected = true;
+        _dbgEngTransport = KdTransport.KDNET;
         _execStatus = DebugExecutionStatus.Go;
         _coordinator.SetKdConnected(KdTransport.KDNET);
         // Override the state that SetKdConnected sets to Break
@@ -555,6 +559,7 @@ public class StateCoordinatorTests : IDisposable
         _coordinator.SetKdConnected(KdTransport.KDNET);
         _coordinator.State.KdBreakReason = "Initial breakpoint";
         _coordinator.State.KdWaitPending = true;
+        _coordinator.State.PendingEventCount = 2;
         _coordinator.SetBsodDetected("0x7E");
 
         _coordinator.SetKdDisconnected();
@@ -564,8 +569,36 @@ public class StateCoordinatorTests : IDisposable
         Assert.Equal(DebugExecutionStatus.NoDebuggee, state.KdExecStatus);
         Assert.Null(state.KdBreakReason);
         Assert.False(state.KdWaitPending);
+        Assert.Equal(0, state.PendingEventCount);
         Assert.False(state.IsBugcheck);
         Assert.Null(state.BugcheckCode);
+    }
+
+    [Fact]
+    public void SetKdRunning_SetsExecutionState()
+    {
+        _coordinator.SetKdConnected(KdTransport.KDNET);
+        _coordinator.State.KdBreakReason = "Manual break";
+        _coordinator.State.KdWaitPending = true;
+        _coordinator.SetBsodDetected("0x7E");
+
+        _coordinator.SetKdRunning();
+
+        Assert.Equal(DebugExecutionStatus.Go, _coordinator.State.KdExecStatus);
+        Assert.Null(_coordinator.State.KdBreakReason);
+        Assert.False(_coordinator.State.KdWaitPending);
+    }
+
+    [Fact]
+    public void SetKdBroken_SetsExecutionState()
+    {
+        _coordinator.SetKdConnected(KdTransport.KDNET);
+        _coordinator.SetKdRunning();
+
+        _coordinator.SetKdBroken("Debug event");
+
+        Assert.Equal(DebugExecutionStatus.Break, _coordinator.State.KdExecStatus);
+        Assert.Equal("Debug event", _coordinator.State.KdBreakReason);
     }
 
     [Fact]
@@ -620,6 +653,38 @@ public class StateCoordinatorTests : IDisposable
         await _coordinator.RefreshStateAsync();
 
         Assert.False(_coordinator.State.KdConnected);
+    }
+
+    [Fact]
+    public async Task RefreshState_DetectsManagerDisconnectWhenStateWasStale()
+    {
+        SetVmRunning();
+        SetKdConnectedBroken();
+
+        _dbgEngConnected = false;
+        _dbgEngTransport = KdTransport.None;
+
+        await _coordinator.RefreshStateAsync();
+
+        Assert.False(_coordinator.State.KdConnected);
+        Assert.Equal(KdTransport.None, _coordinator.State.KdTransportType);
+        Assert.Equal(DebugExecutionStatus.NoDebuggee, _coordinator.State.KdExecStatus);
+    }
+
+    [Fact]
+    public async Task RefreshState_RecoversLiveDbgEngConnectionWhenCoordinatorWasStale()
+    {
+        SetVmRunning();
+        _dbgEngConnected = true;
+        _dbgEngTransport = KdTransport.KDNET;
+        _execStatus = DebugExecutionStatus.Break;
+
+        await _coordinator.RefreshStateAsync();
+
+        Assert.True(_coordinator.State.KdConnected);
+        Assert.Equal(KdTransport.KDNET, _coordinator.State.KdTransportType);
+        Assert.Equal(DebugExecutionStatus.Break, _coordinator.State.KdExecStatus);
+        Assert.Null(await _coordinator.ValidatePreconditionsAsync("kd_disconnect"));
     }
 
     [Fact]

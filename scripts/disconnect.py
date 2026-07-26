@@ -16,6 +16,23 @@ import sys
 from mcp_client import McpSseClient
 
 
+def tool_ok(err, txt):
+    if err:
+        return False
+    failure_markers = (
+        " completed with error",
+        " failed",
+        "timed out",
+        "cannot ",
+        "requires ",
+        "not connected",
+        "not attached",
+        "unknown action",
+    )
+    lowered = txt.lower()
+    return not any(marker in lowered for marker in failure_markers)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Detach KD from windbg-mcp.")
     ap.add_argument("--host")
@@ -31,7 +48,7 @@ def main() -> int:
 
     err, txt = c.call_tool("kd_disconnect")
     print(txt)
-    return 1 if err else 0
+    return 0 if tool_ok(err, txt) else 1
 
 
 if __name__ == "__main__":

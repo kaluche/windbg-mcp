@@ -152,6 +152,7 @@ kd_execute command="lm"
 kd_execute command="k"
 kd_execute command="r"
 kd_continue
+kd_wait_for_event
 kd_disconnect
 ```
 
