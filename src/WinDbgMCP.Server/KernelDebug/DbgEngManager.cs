@@ -144,15 +144,17 @@ public sealed class DbgEngManager : IDisposable
             _logger.LogInformation("AttachKernel succeeded, waiting for initial breakpoint...");
 
             // WaitForEvent for live kernel targets MUST use INFINITE timeout
-            // (per Microsoft docs). Use SetInterrupt from a timer as safety net.
+            // (per Microsoft docs). Use DEBUG_INTERRUPT_EXIT from a timer as
+            // the safety net so the wait is cancelled without breaking the target.
             var waitTimeoutMs = _config.Timeouts.KdInitialBreakSeconds * 1000;
-            using var interruptTimer = new Timer(_ =>
-            {
-                try { _client?.Control.SetInterrupt(DEBUG_INTERRUPT.ACTIVE); }
-                catch { }
-            }, null, waitTimeoutMs, Timeout.Infinite);
+            using var interruptTimer = CreateInterruptTimer(
+                DbgEngInterruptPurpose.ConnectInitialBreakTimeout,
+                waitTimeoutMs);
 
-            var waitHr = _client.Control.TryWaitForEvent(DEBUG_WAIT.DEFAULT, unchecked((int)0xFFFFFFFF));
+            var waitHr = _client.Control.TryWaitForEvent(
+                DEBUG_WAIT.DEFAULT,
+                DbgEngEventHandling.InfiniteWaitMilliseconds);
+            interruptTimer.Dispose();
 
             if (waitHr == HRESULT.S_OK)
             {
@@ -166,9 +168,9 @@ public sealed class DbgEngManager : IDisposable
                 return $"Connected to kernel via {transport}. Target is at initial breakpoint. " +
                        "You can now use kd_execute to run WinDbg commands, or kd_continue to resume.";
             }
-            else if (waitHr == HRESULT.S_FALSE)
+            else if (DbgEngEventHandling.IsNormalNonEventWaitResult(waitHr))
             {
-                // Timeout — target is running but we're connected
+                // Timeout/exit interrupt — target is running but we're connected
                 _logger.LogInformation("Connected. Target is running (no initial break within timeout).");
                 _thread.PumpEnabled = true;
 
@@ -181,7 +183,8 @@ public sealed class DbgEngManager : IDisposable
                 _client.TryEndSession(DEBUG_END.ACTIVE_TERMINATE);
                 _client = null;
                 throw new InvalidOperationException(
-                    $"WaitForEvent failed: {waitHr}. " + ErrorMessages.KdConnectFailed);
+                    $"WaitForEvent failed: {DbgEngEventHandling.FormatHResult(waitHr)}. " +
+                    ErrorMessages.KdConnectFailed);
             }
         }, timeout);
     }
@@ -318,19 +321,19 @@ public sealed class DbgEngManager : IDisposable
 
             _thread.PumpEnabled = false;
 
-            _client.Control.SetInterrupt(DEBUG_INTERRUPT.ACTIVE);
+            _client.Control.SetInterrupt(
+                DbgEngEventHandling.GetInterrupt(DbgEngInterruptPurpose.ExplicitTargetBreak));
 
             // Wait for the break to take effect (INFINITE + interrupt timer for kernel targets)
             var breakTimeoutMs = _config.Timeouts.KdBreakSeconds * 1000;
-            using var interruptTimer = new Timer(_ =>
-            {
-                try { _client?.Control.SetInterrupt(DEBUG_INTERRUPT.ACTIVE); }
-                catch { }
-            }, null, breakTimeoutMs, Timeout.Infinite);
+            using var interruptTimer = CreateInterruptTimer(
+                DbgEngInterruptPurpose.BreakWaitTimeout,
+                breakTimeoutMs);
 
             var waitHr = _client.Control.TryWaitForEvent(
                 DEBUG_WAIT.DEFAULT,
-                unchecked((int)0xFFFFFFFF));
+                DbgEngEventHandling.InfiniteWaitMilliseconds);
+            interruptTimer.Dispose();
 
             if (waitHr == HRESULT.S_OK)
             {
@@ -343,11 +346,16 @@ public sealed class DbgEngManager : IDisposable
                 return $"Target halted. {lastEvent}\n" +
                        "Use kd_execute to inspect state (e.g., 'k' for stack, 'r' for registers).";
             }
-            else
+
+            if (DbgEngEventHandling.IsNormalNonEventWaitResult(waitHr))
             {
+                _thread.PumpEnabled = true;
                 return "SetInterrupt sent but target did not break within timeout. " +
                        "The target may be in a non-interruptible state. Try again or check get_system_state.";
             }
+
+            throw new InvalidOperationException(
+                $"WaitForEvent after SetInterrupt failed: {DbgEngEventHandling.FormatHResult(waitHr)}");
         }, timeout + TimeSpan.FromSeconds(2));
     }
 
@@ -397,15 +405,14 @@ public sealed class DbgEngManager : IDisposable
 
             // Wait for step to complete (INFINITE + interrupt timer for kernel targets)
             var stepTimeoutMs = _config.Timeouts.KdStepSeconds * 1000;
-            using var interruptTimer = new Timer(_ =>
-            {
-                try { _client?.Control.SetInterrupt(DEBUG_INTERRUPT.ACTIVE); }
-                catch { }
-            }, null, stepTimeoutMs, Timeout.Infinite);
+            using var interruptTimer = CreateInterruptTimer(
+                DbgEngInterruptPurpose.StepTimeout,
+                stepTimeoutMs);
 
             var waitHr = _client.Control.TryWaitForEvent(
                 DEBUG_WAIT.DEFAULT,
-                unchecked((int)0xFFFFFFFF));
+                DbgEngEventHandling.InfiniteWaitMilliseconds);
+            interruptTimer.Dispose();
 
             if (waitHr == HRESULT.S_OK)
             {
@@ -422,11 +429,16 @@ public sealed class DbgEngManager : IDisposable
 
                 return $"Step {mode} complete.\n{rip}\n{disasm}";
             }
-            else
+
+            if (DbgEngEventHandling.IsNormalNonEventWaitResult(waitHr))
             {
+                _thread.PumpEnabled = true;
                 return $"Step {mode} timed out. The instruction may have caused a long-running " +
                        "operation. Call kd_break to interrupt, or kd_wait_for_event to continue waiting.";
             }
+
+            throw new InvalidOperationException(
+                $"WaitForEvent after step failed: {DbgEngEventHandling.FormatHResult(waitHr)}");
         }, timeout + TimeSpan.FromSeconds(2));
     }
 
@@ -446,18 +458,14 @@ public sealed class DbgEngManager : IDisposable
 
             // INFINITE timeout + interrupt timer for kernel targets
             var waitTimeoutMs = timeoutSeconds * 1000;
-            using var interruptTimer = new Timer(_ =>
-            {
-                try { _client?.Control.SetInterrupt(DEBUG_INTERRUPT.ACTIVE); }
-                catch { }
-            }, null, waitTimeoutMs, Timeout.Infinite);
+            using var interruptTimer = CreateInterruptTimer(
+                DbgEngInterruptPurpose.WaitForEventTimeout,
+                waitTimeoutMs);
 
             var waitHr = _client.Control.TryWaitForEvent(
                 DEBUG_WAIT.DEFAULT,
-                unchecked((int)0xFFFFFFFF));
-
-            // Check if we got a real event or our own interrupt
-            var execStatus = _client.Control.ExecutionStatus;
+                DbgEngEventHandling.InfiniteWaitMilliseconds);
+            interruptTimer.Dispose();
 
             if (waitHr == HRESULT.S_OK)
             {
@@ -475,7 +483,8 @@ public sealed class DbgEngManager : IDisposable
 
                 return $"Debug event received! Target is now halted.\n{lastEvent}{eventSummary}";
             }
-            else
+
+            if (DbgEngEventHandling.IsNormalNonEventWaitResult(waitHr))
             {
                 _thread.PumpEnabled = true;
                 return $"No debug event received within {timeoutSeconds}s. Target is still running. " +
@@ -483,6 +492,9 @@ public sealed class DbgEngManager : IDisposable
                        "(2) Call kd_break to manually halt the target, or " +
                        "(3) Proceed with guest operations while the target runs.";
             }
+
+            throw new InvalidOperationException(
+                $"WaitForEvent failed: {DbgEngEventHandling.FormatHResult(waitHr)}");
         }, timeout + TimeSpan.FromSeconds(5)); // Outer timeout slightly larger
     }
 
@@ -530,45 +542,56 @@ public sealed class DbgEngManager : IDisposable
 
         // For kernel targets, WaitForEvent must use INFINITE.
         // Use an interrupt timer to periodically yield so the DbgEng thread
-        // can process work items (tool calls). 5s balances responsiveness
-        // with minimizing target micro-freezes.
-        using var interruptTimer = new Timer(_ =>
-        {
-            try { _client?.Control.SetInterrupt(DEBUG_INTERRUPT.ACTIVE); }
-            catch { }
-        }, null, 5000, Timeout.Infinite);
+        // can process work items (tool calls). 5s balances MCP responsiveness
+        // with debugger wait overhead.
+        using var interruptTimer = CreateInterruptTimer(
+            DbgEngInterruptPurpose.EventPumpYield,
+            5000);
 
-        var hr = _client.Control.TryWaitForEvent(DEBUG_WAIT.DEFAULT, unchecked((int)0xFFFFFFFF));
+        var hr = _client.Control.TryWaitForEvent(
+            DEBUG_WAIT.DEFAULT,
+            DbgEngEventHandling.InfiniteWaitMilliseconds);
+        interruptTimer.Dispose();
 
-        if (hr == HRESULT.S_OK)
+        var status = hr == HRESULT.S_OK
+            ? _client.Control.ExecutionStatus
+            : DEBUG_STATUS.NO_CHANGE;
+
+        switch (DbgEngEventHandling.ClassifyPumpResult(hr, status, _eventCallbacks.HasBreakingEvent))
         {
-            var status = _client.Control.ExecutionStatus;
-            if (status == DEBUG_STATUS.BREAK)
-            {
-                if (_eventCallbacks.HasBreakingEvent)
-                {
-                    // Real event (breakpoint, exception, system error) — stop pumping
-                    _thread.PumpEnabled = false;
-                }
-                else
-                {
-                    // Our yield interrupt — resume target and keep pumping.
-                    // The next WaitForEvent call will dispatch the GO.
-                    _client.Control.TrySetExecutionStatus(DEBUG_STATUS.GO);
-                }
-            }
-            // If status is still GO, it was just our interrupt to yield — keep pumping
-        }
-        else
-        {
-            // Error — stop pumping
-            _thread.PumpEnabled = false;
+            case DbgEngPumpOutcome.KeepPumping:
+                break;
+
+            case DbgEngPumpOutcome.StopOnBreakingEvent:
+                // Real event (breakpoint, exception, system error) — stop pumping.
+                _thread.PumpEnabled = false;
+                break;
+
+            case DbgEngPumpOutcome.StopOnUnknownBreak:
+                // With EXIT-based wakeups, an unclassified break is not known to be
+                // synthetic. Leave the target halted for the user instead of
+                // automatically resuming a possibly real event.
+                _logger.LogWarning("Event pump stopped on unclassified debugger break.");
+                _thread.PumpEnabled = false;
+                break;
+
+            case DbgEngPumpOutcome.StopOnUnexpectedFailure:
+                _logger.LogWarning(
+                    "Event pump stopped after WaitForEvent returned {HResult}",
+                    DbgEngEventHandling.FormatHResult(hr));
+                _thread.PumpEnabled = false;
+                break;
         }
     }
 
     // ═══════════════════════════════════════════════════════════════
     //  HELPERS
     // ═══════════════════════════════════════════════════════════════
+
+    private DbgEngInterruptTimer CreateInterruptTimer(
+        DbgEngInterruptPurpose purpose,
+        int dueTimeMs) =>
+        new(() => _client, purpose, dueTimeMs, _logger);
 
     private static string? FindDebuggerDirectory()
     {
