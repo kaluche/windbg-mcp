@@ -66,6 +66,7 @@ public sealed class KernelDebugConfig
     public SerialConfig Serial { get; set; } = new();
     public string SymbolPath { get; set; } = @"srv*C:\Symbols*https://msdl.microsoft.com/download/symbols";
     public string TranscriptDirectory { get; set; } = @"C:\tmp\windbg-mcp\transcripts";
+    public bool ExitProcessOnDbgEngWedge { get; set; }
 }
 
 public sealed class KdnetConfig

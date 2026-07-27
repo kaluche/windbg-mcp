@@ -95,7 +95,7 @@ if (config.Vm.VmwareEnabled)
 builder.Services
     .AddMcpServer(options =>
     {
-        options.ServerInfo = new() { Name = "WinDbgMCP", Version = "1.0.1" };
+        options.ServerInfo = new() { Name = "WinDbgMCP", Version = "1.0.1a" };
         options.ServerInstructions = BuildServerInstructions(config);
     })
     .WithStdioServerTransport()

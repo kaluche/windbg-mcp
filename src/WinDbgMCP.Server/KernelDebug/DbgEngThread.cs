@@ -10,10 +10,13 @@ namespace WinDbgMCP.Server.KernelDebug;
 /// </summary>
 public sealed class DbgEngThread : IDisposable
 {
-    private readonly Thread _thread;
+    private readonly object _lifecycleLock = new();
     private readonly BlockingCollection<WorkItem> _workQueue = new();
     private readonly CancellationTokenSource _cts = new();
     private readonly ILogger _logger;
+    private Thread _thread;
+    private int _activeWorkerGeneration;
+    private int _pumpingWorkerGeneration = -1;
     private volatile bool _disposed;
 
     /// <summary>
@@ -41,6 +44,12 @@ public sealed class DbgEngThread : IDisposable
     public Action? WorkQueuedWhilePumpingAction { get; set; }
 
     /// <summary>
+    /// Called after the worker is abandoned because a native call or pump wait
+    /// exceeded its timeout. The manager uses this to drop stale DbgEng state.
+    /// </summary>
+    public Action? WorkerWedgedAction { get; set; }
+
+    /// <summary>
     /// Whether event pumping is enabled (only when target is running).
     /// </summary>
     public volatile bool PumpEnabled;
@@ -48,35 +57,37 @@ public sealed class DbgEngThread : IDisposable
     public DbgEngThread(ILogger logger)
     {
         _logger = logger;
-        _thread = new Thread(Run)
-        {
-            IsBackground = true,
-            Name = "DbgEng-Thread"
-        };
-        _thread.SetApartmentState(ApartmentState.MTA);
-        _thread.Start();
+        _thread = StartWorker(0);
     }
 
-    private void Run()
+    private Thread StartWorker(int generation)
     {
-        _logger.LogInformation("DbgEng thread started (ThreadId={ThreadId})", Environment.CurrentManagedThreadId);
+        var thread = new Thread(() => Run(generation))
+        {
+            IsBackground = true,
+            Name = $"DbgEng-Thread-{generation}"
+        };
+        if (OperatingSystem.IsWindows())
+            thread.SetApartmentState(ApartmentState.MTA);
+        thread.Start();
+        return thread;
+    }
+
+    private void Run(int generation)
+    {
+        _logger.LogInformation(
+            "DbgEng thread started (ThreadId={ThreadId}, Generation={Generation})",
+            Environment.CurrentManagedThreadId,
+            generation);
 
         try
         {
-            while (!_cts.IsCancellationRequested)
+            while (!_cts.IsCancellationRequested && IsActiveGeneration(generation))
             {
                 // Priority 1: Process any queued tool calls
                 if (_workQueue.TryTake(out var work, TimeSpan.FromMilliseconds(0)))
                 {
-                    try
-                    {
-                        work.Execute();
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Work item failed on DbgEng thread");
-                        work.SetException(ex);
-                    }
+                    ExecuteWorkItem(work, generation);
                     continue;
                 }
 
@@ -86,18 +97,12 @@ public sealed class DbgEngThread : IDisposable
                     try
                     {
                         PumpArmingAction?.Invoke();
+                        Volatile.Write(ref _pumpingWorkerGeneration, generation);
                         if (_workQueue.TryTake(out work, TimeSpan.FromMilliseconds(0)))
                         {
+                            Volatile.Write(ref _pumpingWorkerGeneration, -1);
                             PumpDisarmedAction?.Invoke();
-                            try
-                            {
-                                work.Execute();
-                            }
-                            catch (Exception ex)
-                            {
-                                _logger.LogError(ex, "Work item failed on DbgEng thread");
-                                work.SetException(ex);
-                            }
+                            ExecuteWorkItem(work, generation);
                             continue;
                         }
 
@@ -109,6 +114,7 @@ public sealed class DbgEngThread : IDisposable
                     }
                     finally
                     {
+                        Volatile.Write(ref _pumpingWorkerGeneration, -1);
                         PumpDisarmedAction?.Invoke();
                     }
                     continue;
@@ -123,7 +129,101 @@ public sealed class DbgEngThread : IDisposable
             // Expected on shutdown
         }
 
-        _logger.LogInformation("DbgEng thread exiting");
+        _logger.LogInformation(
+            "DbgEng thread exiting (ThreadId={ThreadId}, Generation={Generation})",
+            Environment.CurrentManagedThreadId,
+            generation);
+    }
+
+    private bool IsActiveGeneration(int generation) =>
+        Volatile.Read(ref _activeWorkerGeneration) == generation;
+
+    private void ExecuteWorkItem(WorkItem work, int generation)
+    {
+        if (work.IsCancellationRequested)
+        {
+            work.SetCanceled();
+            work.Complete();
+            return;
+        }
+
+        work.MarkStarted(generation);
+
+        try
+        {
+            work.Execute();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Work item failed on DbgEng thread");
+            work.SetException(ex);
+        }
+        finally
+        {
+            work.Complete();
+        }
+    }
+
+    private void HandleWorkItemTimeout(WorkItem item)
+    {
+        var restartReason = item.IsRunning
+            ? "running work item timed out"
+            : IsItemQueuedBehindActivePump(item)
+                ? "queued work item timed out behind the event pump"
+                : null;
+
+        if (restartReason == null)
+            return;
+
+        AbandonCurrentWorker(item.EffectiveGeneration, restartReason);
+    }
+
+    private bool IsItemQueuedBehindActivePump(WorkItem item)
+    {
+        var generation = Volatile.Read(ref _activeWorkerGeneration);
+        return item.QueuedGeneration == generation &&
+               Volatile.Read(ref _pumpingWorkerGeneration) == generation;
+    }
+
+    private void AbandonCurrentWorker(int generation, string reason)
+    {
+        Action? workerWedgedAction;
+        int nextGeneration;
+
+        lock (_lifecycleLock)
+        {
+            if (_disposed || generation != _activeWorkerGeneration)
+                return;
+
+            nextGeneration = generation + 1;
+            PumpEnabled = false;
+            Volatile.Write(ref _pumpingWorkerGeneration, -1);
+            Volatile.Write(ref _activeWorkerGeneration, nextGeneration);
+            workerWedgedAction = WorkerWedgedAction;
+
+            _logger.LogError(
+                "DbgEng worker generation {Generation} appears wedged ({Reason}); abandoning it and starting generation {NextGeneration}.",
+                generation,
+                reason,
+                nextGeneration);
+        }
+
+        try
+        {
+            workerWedgedAction?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "DbgEng worker wedge cleanup action failed.");
+        }
+
+        lock (_lifecycleLock)
+        {
+            if (_disposed || _activeWorkerGeneration != nextGeneration)
+                return;
+
+            _thread = StartWorker(nextGeneration);
+        }
     }
 
     /// <summary>
@@ -134,33 +234,34 @@ public sealed class DbgEngThread : IDisposable
         if (_disposed)
             throw new ObjectDisposedException(nameof(DbgEngThread));
 
+        var queuedGeneration = Volatile.Read(ref _activeWorkerGeneration);
         var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var cts = new CancellationTokenSource(timeout);
 
-        var item = new WorkItem(() =>
-        {
-            if (cts.IsCancellationRequested)
-            {
-                tcs.TrySetCanceled();
-                return;
-            }
-
-            try
+        var item = new WorkItem(
+            () =>
             {
                 var result = work();
                 tcs.TrySetResult(result);
-            }
-            catch (Exception ex)
-            {
-                tcs.TrySetException(ex);
-            }
-        });
+            },
+            ex => tcs.TrySetException(ex),
+            () => tcs.TrySetCanceled(),
+            timeout,
+            queuedGeneration,
+            HandleWorkItemTimeout);
 
-        // Register timeout cancellation
-        cts.Token.Register(() => tcs.TrySetCanceled(), useSynchronizationContext: false);
+        var queued = false;
+        try
+        {
+            _workQueue.Add(item);
+            queued = true;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException)
+        {
+            item.SetCanceled();
+            item.Complete();
+        }
 
-        _workQueue.Add(item);
-        if (PumpEnabled)
+        if (queued && PumpEnabled)
         {
             try
             {
@@ -201,15 +302,71 @@ public sealed class DbgEngThread : IDisposable
     private class WorkItem
     {
         private readonly Action _action;
-        private Exception? _exception;
+        private readonly Action<Exception> _setException;
+        private readonly Action _setCanceled;
+        private readonly CancellationTokenSource _timeoutCts;
+        private readonly CancellationTokenRegistration _timeoutRegistration;
+        private readonly Action<WorkItem> _onTimeout;
+        private int _started;
+        private int _completed;
+        private int _timedOut;
+        private int _startedGeneration = -1;
 
-        public WorkItem(Action action) => _action = action;
+        public WorkItem(
+            Action action,
+            Action<Exception> setException,
+            Action setCanceled,
+            TimeSpan timeout,
+            int queuedGeneration,
+            Action<WorkItem> onTimeout)
+        {
+            _action = action;
+            _setException = setException;
+            _setCanceled = setCanceled;
+            _onTimeout = onTimeout;
+            QueuedGeneration = queuedGeneration;
+            _timeoutCts = new CancellationTokenSource(timeout);
+            _timeoutRegistration = _timeoutCts.Token.Register(
+                static state => ((WorkItem)state!).Timeout(),
+                this,
+                useSynchronizationContext: false);
+        }
+
+        public int QueuedGeneration { get; }
+        public int EffectiveGeneration =>
+            Volatile.Read(ref _started) != 0 ? Volatile.Read(ref _startedGeneration) : QueuedGeneration;
+        public bool IsCancellationRequested => _timeoutCts.IsCancellationRequested;
+        public bool IsRunning =>
+            Volatile.Read(ref _started) != 0 && Volatile.Read(ref _completed) == 0;
 
         public void Execute() => _action();
 
-        public void SetException(Exception ex)
+        public void MarkStarted(int generation)
         {
-            _exception = ex;
+            Volatile.Write(ref _startedGeneration, generation);
+            Volatile.Write(ref _started, 1);
+        }
+
+        public void SetException(Exception ex) => _setException(ex);
+
+        public void SetCanceled() => _setCanceled();
+
+        public void Complete()
+        {
+            if (Interlocked.Exchange(ref _completed, 1) != 0)
+                return;
+
+            _timeoutRegistration.Dispose();
+            _timeoutCts.Dispose();
+        }
+
+        private void Timeout()
+        {
+            if (Interlocked.Exchange(ref _timedOut, 1) != 0)
+                return;
+
+            SetCanceled();
+            _onTimeout(this);
         }
     }
 }

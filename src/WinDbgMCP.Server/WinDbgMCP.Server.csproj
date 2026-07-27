@@ -9,7 +9,7 @@
     <Version>1.0.1</Version>
     <AssemblyVersion>1.0.1.0</AssemblyVersion>
     <FileVersion>1.0.1.0</FileVersion>
-    <InformationalVersion>1.0.1</InformationalVersion>
+    <InformationalVersion>1.0.1a</InformationalVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <SelfContained>true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>

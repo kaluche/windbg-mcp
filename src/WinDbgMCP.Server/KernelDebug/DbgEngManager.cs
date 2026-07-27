@@ -46,6 +46,7 @@ public sealed class DbgEngManager : IDisposable
         _thread.PumpArmingAction = ArmPumpWait;
         _thread.PumpDisarmedAction = DisarmPumpWait;
         _thread.WorkQueuedWhilePumpingAction = WakePumpForQueuedWork;
+        _thread.WorkerWedgedAction = HandleWorkerWedge;
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -187,11 +188,6 @@ public sealed class DbgEngManager : IDisposable
                 _eventCallbacks.SetExecutionStatus(DEBUG_STATUS.BREAK);
                 _logger.LogInformation("Connected. Target at initial breakpoint.");
 
-                // Force reload symbols
-                _outputCapture.Clear();
-                _client.Control.TryExecute(DEBUG_OUTCTL.THIS_CLIENT, ".reload /f", DEBUG_EXECUTE.DEFAULT);
-                _outputCapture.GetAndClear(); // Discard reload output
-
                 return $"Connected to kernel via {transport}. Target is at initial breakpoint. " +
                        "You can now use kd_execute to run WinDbg commands, or kd_continue to resume.";
             }
@@ -243,53 +239,62 @@ public sealed class DbgEngManager : IDisposable
         if (wasPumping)
             QueueInterrupt(DbgEngInterruptPurpose.DisconnectPumpWake);
 
-        return await _thread.ExecuteAsync(() =>
+        try
         {
-            _thread.PumpEnabled = false;
-
-            if (_client == null)
-                return "Not connected.";
-
-            try
+            return await _thread.ExecuteAsync(() =>
             {
-                var status = _client.Control.ExecutionStatus;
-                if (status == DEBUG_STATUS.BREAK)
+                _thread.PumpEnabled = false;
+
+                if (_client == null)
+                    return "Not connected.";
+
+                try
                 {
-                    // ACTIVE_DETACH disconnects from the target, but request GO first
-                    // so a live target is not intentionally left frozen while detaching.
-                    var resumeHr = _client.Control.TrySetExecutionStatus(
-                        DbgEngEventHandling.GetContinueExecutionStatus());
-                    if (resumeHr == HRESULT.S_OK)
-                        _eventCallbacks.SetExecutionStatus(DEBUG_STATUS.GO);
-                    else
-                        _logger.LogDebug(
-                            "Ignoring failed resume before detach: {HResult}",
-                            DbgEngEventHandling.FormatHResult(resumeHr));
+                    var status = _client.Control.ExecutionStatus;
+                    if (status == DEBUG_STATUS.BREAK)
+                    {
+                        // ACTIVE_DETACH disconnects from the target, but request GO first
+                        // so a live target is not intentionally left frozen while detaching.
+                        var resumeHr = _client.Control.TrySetExecutionStatus(
+                            DbgEngEventHandling.GetContinueExecutionStatus());
+                        if (resumeHr == HRESULT.S_OK)
+                            _eventCallbacks.SetExecutionStatus(DEBUG_STATUS.GO);
+                        else
+                            _logger.LogDebug(
+                                "Ignoring failed resume before detach: {HResult}",
+                                DbgEngEventHandling.FormatHResult(resumeHr));
+                    }
                 }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "Ignoring failure while checking/resuming target before detach.");
-            }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Ignoring failure while checking/resuming target before detach.");
+                }
 
-            try
-            {
-                _client?.TryEndSession(DEBUG_END.ACTIVE_DETACH);
-            }
-            catch { }
+                try
+                {
+                    _client?.TryEndSession(DEBUG_END.ACTIVE_DETACH);
+                }
+                catch { }
 
-            _interruptor?.Dispose();
-            _interruptor = null;
-            _client = null;
-            _isAttached = false;
-            _transport = KdTransport.None;
-            Volatile.Write(ref _pumpWaitActive, 0);
-            Volatile.Write(ref _nonBreakingPumpWakePending, 0);
-            _eventCallbacks.ClearEvents();
-            _eventCallbacks.SetExecutionStatus(DEBUG_STATUS.NO_DEBUGGEE);
-            _logger.LogInformation("Disconnected from kernel debugger.");
-            return "Disconnected from kernel debugger. Target has been resumed.";
-        }, TimeSpan.FromSeconds(30));
+                _interruptor?.Dispose();
+                _interruptor = null;
+                _client = null;
+                _isAttached = false;
+                _transport = KdTransport.None;
+                Volatile.Write(ref _pumpWaitActive, 0);
+                Volatile.Write(ref _nonBreakingPumpWakePending, 0);
+                _eventCallbacks.ClearEvents();
+                _eventCallbacks.SetExecutionStatus(DEBUG_STATUS.NO_DEBUGGEE);
+                _logger.LogInformation("Disconnected from kernel debugger.");
+                return "Disconnected from kernel debugger. Target has been resumed.";
+            }, TimeSpan.FromSeconds(30));
+        }
+        catch (OperationCanceledException)
+        {
+            ResetConnectionState();
+            return "Kernel debugger session was force-reset after detach timed out. " +
+                   "Start a new session with kd_connect when the target is reachable.";
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -707,6 +712,24 @@ public sealed class DbgEngManager : IDisposable
             _logger.LogDebug(ex, "Ignoring failed DbgEng interrupt for {Purpose}", purpose);
             return false;
         }
+    }
+
+    private void HandleWorkerWedge()
+    {
+        if (_config.KernelDebug.ExitProcessOnDbgEngWedge)
+        {
+            const int exitCode = 86;
+            _logger.LogCritical(
+                "DbgEng worker was abandoned after a timeout; exiting process with code {ExitCode} so the supervisor can restart DbgEng.",
+                exitCode);
+            Environment.Exit(exitCode);
+            return;
+        }
+
+        _logger.LogWarning(
+            "DbgEng worker was abandoned after a timeout; resetting kernel debug state. " +
+            "A full process restart may still be required for KDNET recovery.");
+        ResetConnectionState();
     }
 
     internal static TimeSpan GetConnectOperationTimeout(TimeoutConfig timeouts) =>

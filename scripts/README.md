@@ -106,6 +106,38 @@ python scripts/connect.py --kernel --break-on-connect
 python scripts/disconnect.py --all
 ```
 
+## Windows MCP Supervisor
+
+Run `mcp-proxy` and `WinDbgMCP.Server.exe` in a restart loop on the Windows
+debugger host. The supervisor monitors the backend `WinDbgMCP.Server.exe`
+process and restarts `mcp-proxy` if that backend exits while the proxy keeps
+listening. Normal server configuration still comes from `appsettings.json`
+beside `WinDbgMCP.Server.exe`, inherited `WINDBG_MCP_*` environment variables,
+or server command-line arguments:
+
+```cmd
+scripts\windbg-mcp-supervisor.cmd
+```
+
+The default server binary path is:
+
+```text
+C:\DATA\tools\windbg-mcp\src\WinDbgMCP.Server\bin\Debug\net8.0-windows\win-x64\WinDbgMCP.Server.exe
+```
+
+Override it if needed:
+
+```cmd
+scripts\windbg-mcp-supervisor.cmd -ServerExe C:\path\to\WinDbgMCP.Server.exe
+```
+
+If you do not keep the KDNET key in `appsettings.json`, pass it to the
+supervisor:
+
+```cmd
+scripts\windbg-mcp-supervisor.cmd -KdnetKey YOUR.KDNET.KEY
+```
+
 ## Frida
 
 These MCP scripts do not manage Frida in the current deployment. Use direct operator-host Frida commands instead:

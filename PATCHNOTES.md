@@ -1,5 +1,13 @@
 # Patch Notes
 
+## 1.0.1a - 2026-07-27
+
+- Added DbgEng worker wedge detection and recovery so timed-out KD work can be abandoned without corrupting subsequent requests.
+- Added optional process exit on DbgEng wedge for supervisor-driven KDNET recovery.
+- Added Windows supervisor scripts for restarting `mcp-proxy` and the WinDbgMCP server after backend exits.
+- Removed automatic `.reload /f` during KD attach to avoid post-connect DbgEng stalls.
+- Documented `WINDBG_MCP_*` environment variable precedence over `appsettings.json`.
+
 ## 1.0.1 - 2026-07-26
 
 - Fixed MCP-generated synthetic `CONTROL_C` breaks by removing periodic event-pump interrupts.
